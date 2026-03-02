@@ -652,7 +652,7 @@ pub fn runTelegramLoop(
                         .message_sender_id = task_message_sender_id,
                     };
 
-                    const thread = std.Thread.spawn(.{}, messageTaskWorker, .{task}) catch |err| {
+                    const thread = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, messageTaskWorker, .{task}) catch |err| {
                         log.err("Failed to spawn worker thread: {}, falling back to synchronous", .{err});
                         task.deinit();
                         allocator.destroy(task);

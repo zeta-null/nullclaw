@@ -527,6 +527,21 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (diag.object.get("token_usage_ledger_enabled")) |v| {
                 if (v == .bool) self.diagnostics.token_usage_ledger_enabled = v.bool;
             }
+            if (diag.object.get("token_usage_ledger_window_hours")) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+                    self.diagnostics.token_usage_ledger_window_hours = @intCast(v.integer);
+                }
+            }
+            if (diag.object.get("token_usage_ledger_max_bytes")) |v| {
+                if (v == .integer and v.integer >= 0) {
+                    self.diagnostics.token_usage_ledger_max_bytes = @intCast(v.integer);
+                }
+            }
+            if (diag.object.get("token_usage_ledger_max_lines")) |v| {
+                if (v == .integer and v.integer >= 0) {
+                    self.diagnostics.token_usage_ledger_max_lines = @intCast(v.integer);
+                }
+            }
             if (diag.object.get("otel")) |otel| {
                 if (otel == .object) {
                     if (otel.object.get("endpoint")) |v| {

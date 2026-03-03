@@ -77,6 +77,12 @@ pub const DiagnosticsConfig = struct {
     /// Persist per-response token counters to a JSONL ledger near config.json.
     /// This stores token counts only (provider/model/prompt/completion/total), not message text.
     token_usage_ledger_enabled: bool = true,
+    /// Reset token usage ledger after this many hours. 0 disables time-based reset.
+    token_usage_ledger_window_hours: u32 = 24,
+    /// Maximum ledger file size before reset. 0 disables size-based reset.
+    token_usage_ledger_max_bytes: u64 = 0,
+    /// Maximum number of JSONL rows before reset. 0 disables row-limit reset.
+    token_usage_ledger_max_lines: u64 = 0,
 };
 
 pub const AutonomyConfig = struct {

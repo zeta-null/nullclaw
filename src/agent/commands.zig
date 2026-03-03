@@ -505,6 +505,61 @@ fn splitFirstToken(arg: []const u8) struct { head: []const u8, tail: []const u8 
     };
 }
 
+const SUBAGENTS_SPAWN_USAGE = "Usage: /subagents spawn [--agent <name>|--agent=<name>] <task>";
+
+const SubagentSpawnRequest = struct {
+    task: []const u8,
+    agent_name: ?[]const u8 = null,
+};
+
+fn parseSubagentSpawnRequest(arg: []const u8) ?SubagentSpawnRequest {
+    const trimmed = std.mem.trim(u8, arg, " \t");
+    if (trimmed.len == 0) return null;
+
+    const parsed = splitFirstToken(trimmed);
+    if (std.mem.eql(u8, parsed.head, "--agent")) {
+        if (parsed.tail.len == 0) return null;
+        const rest = splitFirstToken(parsed.tail);
+        const agent_name = std.mem.trim(u8, rest.head, " \t");
+        const task = std.mem.trim(u8, rest.tail, " \t");
+        if (agent_name.len == 0 or task.len == 0) return null;
+        return .{ .task = task, .agent_name = agent_name };
+    }
+
+    if (std.mem.startsWith(u8, parsed.head, "--agent=")) {
+        const agent_name = std.mem.trim(u8, parsed.head["--agent=".len..], " \t");
+        const task = std.mem.trim(u8, parsed.tail, " \t");
+        if (agent_name.len == 0 or task.len == 0) return null;
+        return .{ .task = task, .agent_name = agent_name };
+    }
+
+    return .{ .task = trimmed };
+}
+
+test "parseSubagentSpawnRequest parses plain task" {
+    const parsed = parseSubagentSpawnRequest("run quick check") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("run quick check", parsed.task);
+    try std.testing.expect(parsed.agent_name == null);
+}
+
+test "parseSubagentSpawnRequest parses --agent form" {
+    const parsed = parseSubagentSpawnRequest("--agent researcher gather references") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("researcher", parsed.agent_name.?);
+    try std.testing.expectEqualStrings("gather references", parsed.task);
+}
+
+test "parseSubagentSpawnRequest parses --agent= form" {
+    const parsed = parseSubagentSpawnRequest("--agent=researcher gather references") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("researcher", parsed.agent_name.?);
+    try std.testing.expectEqualStrings("gather references", parsed.task);
+}
+
+test "parseSubagentSpawnRequest rejects invalid input" {
+    try std.testing.expect(parseSubagentSpawnRequest("") == null);
+    try std.testing.expect(parseSubagentSpawnRequest("--agent researcher") == null);
+    try std.testing.expect(parseSubagentSpawnRequest("--agent=") == null);
+}
+
 fn parseTaskId(raw: []const u8) ?u64 {
     if (raw.len == 0) return null;
     return std.fmt.parseInt(u64, raw, 10) catch null;
@@ -1382,22 +1437,34 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
     return try out.toOwnedSlice(self.allocator);
 }
 
-fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8) ![]const u8 {
+fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8, agent_name: ?[]const u8) ![]const u8 {
     const trimmed_task = std.mem.trim(u8, task, " \t");
     if (trimmed_task.len == 0) {
-        return try self.allocator.dupe(u8, "Usage: /subagents spawn <task>");
+        return try self.allocator.dupe(u8, SUBAGENTS_SPAWN_USAGE);
     }
 
     const manager = findSubagentManager(self) orelse
         return try self.allocator.dupe(u8, "Spawn tool is not enabled.");
 
     const origin_chat = self.memory_session_id orelse "agent";
-    const task_id = manager.spawn(trimmed_task, label, "agent", origin_chat) catch |err| {
+    const task_id = manager.spawnWithAgent(trimmed_task, label, "agent", origin_chat, agent_name) catch |err| {
         return switch (err) {
             error.TooManyConcurrentSubagents => try self.allocator.dupe(u8, "Too many concurrent subagents. Wait for a task to finish."),
+            error.UnknownAgent => if (agent_name) |name|
+                try std.fmt.allocPrint(self.allocator, "Unknown named agent profile: {s}", .{name})
+            else
+                try self.allocator.dupe(u8, "Unknown named agent profile"),
             else => try std.fmt.allocPrint(self.allocator, "Failed to spawn subagent: {s}", .{@errorName(err)}),
         };
     };
+
+    if (agent_name) |name| {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Spawned subagent task #{d} ({s}) using agent '{s}'.",
+            .{ task_id, label, name },
+        );
+    }
 
     return try std.fmt.allocPrint(
         self.allocator,
@@ -1515,13 +1582,15 @@ fn handleSubagentsCommand(self: anytype, arg: []const u8) ![]const u8 {
             \\Usage:
             \\  /subagents
             \\  /subagents list
-            \\  /subagents spawn <task>
+            \\  /subagents spawn [--agent <name>] <task>
             \\  /subagents info <id>
             \\  /subagents kill <id|all>
         );
     }
     if (std.ascii.eqlIgnoreCase(action, "spawn")) {
-        return try spawnSubagentTask(self, parsed.tail, "subagent");
+        const spawn_req = parseSubagentSpawnRequest(parsed.tail) orelse
+            return try self.allocator.dupe(u8, SUBAGENTS_SPAWN_USAGE);
+        return try spawnSubagentTask(self, spawn_req.task, "subagent", spawn_req.agent_name);
     }
     if (std.ascii.eqlIgnoreCase(action, "info")) {
         const id_text = firstToken(parsed.tail);
@@ -1598,7 +1667,7 @@ fn handleSteerCommand(self: anytype, arg: []const u8) ![]const u8 {
     );
     defer self.allocator.free(follow_up);
 
-    const spawned = try spawnSubagentTask(self, follow_up, "steer");
+    const spawned = try spawnSubagentTask(self, follow_up, "steer", null);
     defer self.allocator.free(spawned);
     return try std.fmt.allocPrint(
         self.allocator,
@@ -1608,7 +1677,7 @@ fn handleSteerCommand(self: anytype, arg: []const u8) ![]const u8 {
 }
 
 fn handleTellCommand(self: anytype, arg: []const u8) ![]const u8 {
-    return try spawnSubagentTask(self, arg, "tell");
+    return try spawnSubagentTask(self, arg, "tell", null);
 }
 
 fn handlePollCommand(self: anytype) ![]const u8 {
@@ -2088,7 +2157,7 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
     defer self.allocator.free(composed);
 
     if (findSubagentManager(self) != null) {
-        return try spawnSubagentTask(self, composed, skill.name);
+        return try spawnSubagentTask(self, composed, skill.name, null);
     }
     return try std.fmt.allocPrint(
         self.allocator,

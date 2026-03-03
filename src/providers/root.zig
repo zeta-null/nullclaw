@@ -185,6 +185,8 @@ pub const ChatResponse = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     usage: TokenUsage = .{},
+    /// Effective provider that produced this response (set by wrappers such as ReliableProvider).
+    provider: []const u8 = "",
     model: []const u8 = "",
     /// Optional reasoning/thinking content from models that support it (e.g. Claude extended thinking).
     reasoning_content: ?[]const u8 = null,

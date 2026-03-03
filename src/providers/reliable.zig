@@ -365,7 +365,14 @@ pub const ReliableProvider = struct {
         var attempt: u32 = 0;
         while (attempt <= self.max_retries) : (attempt += 1) {
             if (prov.chat(allocator, request, current_model, request.temperature)) |result| {
-                return result;
+                var annotated = result;
+                if (annotated.provider.len == 0) {
+                    annotated.provider = allocator.dupe(u8, prov.getName()) catch "";
+                }
+                if (annotated.model.len == 0) {
+                    annotated.model = allocator.dupe(u8, current_model) catch "";
+                }
+                return annotated;
             } else |err| {
                 self.storeErrorName(err);
                 const err_slice = self.lastErrorSlice();
@@ -889,7 +896,11 @@ test "ReliableProvider vtable chat retries then recovers" {
     const request = ChatRequest{ .messages = &msgs };
     const result = try prov.chat(std.testing.allocator, request, "model", 0.5);
     defer if (result.content) |c| std.testing.allocator.free(c);
+    defer if (result.provider.len > 0) std.testing.allocator.free(result.provider);
+    defer if (result.model.len > 0) std.testing.allocator.free(result.model);
     try std.testing.expectEqualStrings("mock chat", result.content.?);
+    try std.testing.expectEqualStrings("MockProvider", result.provider);
+    try std.testing.expectEqualStrings("model", result.model);
     try std.testing.expect(mock.call_count == 2);
 }
 
@@ -1096,7 +1107,11 @@ test "multi-provider chat fallback" {
     const request = ChatRequest{ .messages = &msgs };
     const result = try prov.chat(std.testing.allocator, request, "model", 0.5);
     defer if (result.content) |c| std.testing.allocator.free(c);
+    defer if (result.provider.len > 0) std.testing.allocator.free(result.provider);
+    defer if (result.model.len > 0) std.testing.allocator.free(result.model);
     try std.testing.expectEqualStrings("mock chat", result.content.?);
+    try std.testing.expect(result.provider.len > 0);
+    try std.testing.expectEqualStrings("model", result.model);
     try std.testing.expect(primary.call_count == 1);
     try std.testing.expect(fallback.call_count == 1);
 }

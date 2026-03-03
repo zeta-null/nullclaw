@@ -25,6 +25,7 @@ const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const streaming = @import("streaming.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
+const USAGE_LEDGER_FILENAME = "llm_usage.jsonl";
 
 fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
     if (text.len <= MESSAGE_LOG_MAX_BYTES) {
@@ -69,6 +70,7 @@ pub const SessionManager = struct {
     policy: ?*const SecurityPolicy = null,
 
     mutex: std.Thread.Mutex,
+    usage_log_mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
 
     pub fn init(
@@ -93,6 +95,7 @@ pub const SessionManager = struct {
             .response_cache = response_cache,
             .observer = observer_i,
             .mutex = .{},
+            .usage_log_mutex = .{},
             .sessions = .{},
         };
     }
@@ -136,6 +139,8 @@ pub const SessionManager = struct {
         agent.response_cache = self.response_cache;
         agent.mem_rt = self.mem_rt;
         agent.memory_session_id = owned_key;
+        agent.usage_record_callback = usageRecordForwarder;
+        agent.usage_record_ctx = @ptrCast(self);
 
         session.* = .{
             .agent = agent,
@@ -194,6 +199,49 @@ pub const SessionManager = struct {
     fn streamChunkForwarder(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
         const adapter: *StreamAdapterCtx = @ptrCast(@alignCast(ctx_ptr));
         streaming.forwardProviderChunk(adapter.sink, chunk);
+    }
+
+    fn usageRecordForwarder(ctx_ptr: *anyopaque, record: Agent.UsageRecord) void {
+        const self: *SessionManager = @ptrCast(@alignCast(ctx_ptr));
+        self.appendUsageRecord(record);
+    }
+
+    fn usageLedgerPath(self: *SessionManager) ?[]u8 {
+        const config_dir = std.fs.path.dirname(self.config.config_path) orelse return null;
+        return std.fs.path.join(self.allocator, &.{ config_dir, USAGE_LEDGER_FILENAME }) catch null;
+    }
+
+    fn appendUsageRecord(self: *SessionManager, record: Agent.UsageRecord) void {
+        self.usage_log_mutex.lock();
+        defer self.usage_log_mutex.unlock();
+
+        const ledger_path = self.usageLedgerPath() orelse return;
+        defer self.allocator.free(ledger_path);
+
+        var file = std.fs.openFileAbsolute(ledger_path, .{ .mode = .write_only }) catch |err| switch (err) {
+            error.FileNotFound => std.fs.createFileAbsolute(ledger_path, .{ .truncate = false }) catch return,
+            else => return,
+        };
+        defer file.close();
+
+        file.seekFromEnd(0) catch {};
+
+        var writer_buf: [1024]u8 = undefined;
+        var file_writer = file.writer(&writer_buf);
+        const w = &file_writer.interface;
+        w.print(
+            "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"success\":{}}}\n",
+            .{
+                record.ts,
+                std.json.fmt(record.provider, .{}),
+                std.json.fmt(record.model, .{}),
+                record.usage.prompt_tokens,
+                record.usage.completion_tokens,
+                record.usage.total_tokens,
+                record.success,
+            },
+        ) catch return;
+        w.flush() catch {};
     }
 
     /// Process a message within a session context.

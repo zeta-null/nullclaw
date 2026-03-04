@@ -10,6 +10,7 @@
 //! - KV store for settings
 
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
@@ -23,6 +24,139 @@ pub const c = @cImport({
 pub const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 const BUSY_TIMEOUT_MS: c_int = 5000;
 
+/// Detect whether the filesystem backing `path` supports WAL mode (which
+/// requires mmap).  On Linux, 9p / NFS / CIFS do not support mmap, so we
+/// fall back to DELETE journal mode for those.  On non-Linux or on statfs
+/// failure we default to WAL (the common case).
+///
+/// Primary detection: parse `/proc/self/mountinfo` to find the fs_type for
+/// the longest matching mount_point prefix.  This correctly identifies 9p
+/// even when statfs reports the host's backing filesystem magic (e.g. ZFS).
+///
+/// Fallback: statfs syscall (catches cases where mountinfo is unavailable).
+pub fn shouldUseWal(path: [*:0]const u8) bool {
+    if (comptime builtin.os.tag != .linux) return true;
+
+    const path_span = std.mem.span(path);
+    if (path_span.len == 0 or std.mem.eql(u8, path_span, ":memory:")) return true;
+
+    // Primary: /proc/self/mountinfo
+    if (checkMountinfo(path_span)) |use_wal| return use_wal;
+
+    // Fallback: statfs syscall
+    return checkStatfs(path);
+}
+
+/// Parse /proc/self/mountinfo to find the filesystem type for `path`.
+/// Returns `false` if the fs is 9p/nfs/cifs/smb3, `true` for others,
+/// `null` if mountinfo is unavailable or unparseable.
+fn checkMountinfo(path: []const u8) ?bool {
+    const file = std.fs.openFileAbsolute("/proc/self/mountinfo", .{}) catch return null;
+    defer file.close();
+
+    var best_len: usize = 0;
+    var best_is_network = false;
+    var buf: [4096]u8 = undefined;
+    var carry: [512]u8 = undefined;
+    var carry_len: usize = 0;
+
+    while (true) {
+        const n = file.read(buf[carry_len..]) catch break;
+        if (carry_len > 0) {
+            // Prepend leftover bytes from the previous read
+            @memcpy(buf[0..carry_len], carry[0..carry_len]);
+        }
+        const total = carry_len + n;
+        carry_len = 0;
+        if (total == 0) break;
+
+        var data = buf[0..total];
+        while (data.len > 0) {
+            if (std.mem.indexOfScalar(u8, data, '\n')) |nl| {
+                const line = data[0..nl];
+                data = data[nl + 1 ..];
+                parseMountinfoLine(line, path, &best_len, &best_is_network);
+            } else {
+                // Incomplete line -- carry over to next read
+                const leftover = data.len;
+                if (leftover <= carry.len) {
+                    @memcpy(carry[0..leftover], data[0..leftover]);
+                    carry_len = leftover;
+                }
+                break;
+            }
+        }
+
+        if (n == 0) break; // EOF
+    }
+
+    if (best_len == 0) return null;
+    return !best_is_network;
+}
+
+/// Parse one mountinfo line and update best match if mount_point is a
+/// longer prefix of `path`.
+///
+/// Format: mount_id parent_id major:minor root mount_point flags [opts]* - fs_type source super_opts
+fn parseMountinfoLine(line: []const u8, path: []const u8, best_len: *usize, best_is_network: *bool) void {
+    // Fields are space-separated.  We need field index 4 (mount_point)
+    // and the field after the " - " separator (fs_type).
+    var it = std.mem.splitScalar(u8, line, ' ');
+
+    // Skip mount_id (0), parent_id (1), major:minor (2), root (3)
+    inline for (0..4) |_| {
+        _ = it.next() orelse return;
+    }
+    const mount_point = it.next() orelse return;
+
+    // mount_point must be a prefix of path
+    if (!std.mem.startsWith(u8, path, mount_point)) return;
+    // Ensure it's a proper prefix (exact match, or next char is '/')
+    if (mount_point.len != path.len and mount_point.len > 1 and
+        (mount_point.len >= path.len or path[mount_point.len] != '/'))
+        return;
+    if (mount_point.len <= best_len.*) return;
+
+    // Find " - " separator to locate fs_type
+    const sep = " - ";
+    const sep_pos = std.mem.indexOf(u8, line, sep) orelse return;
+    const after_sep = line[sep_pos + sep.len ..];
+    var sep_it = std.mem.splitScalar(u8, after_sep, ' ');
+    const fs_type = sep_it.next() orelse return;
+
+    best_len.* = mount_point.len;
+    best_is_network.* = isNetworkFs(fs_type);
+}
+
+fn isNetworkFs(fs_type: []const u8) bool {
+    const network_types = [_][]const u8{ "9p", "nfs", "nfs4", "cifs", "smb3" };
+    for (network_types) |nt| {
+        if (std.mem.eql(u8, fs_type, nt)) return true;
+    }
+    return false;
+}
+
+/// Fallback: use the statfs syscall to check f_type.
+fn checkStatfs(path: [*:0]const u8) bool {
+    var buf: [15]usize = undefined;
+    const rc = std.os.linux.syscall2(
+        .statfs,
+        @intFromPtr(path),
+        @intFromPtr(&buf),
+    );
+    const signed_rc: isize = @bitCast(rc);
+    if (signed_rc < 0) return true; // statfs failed, assume WAL is fine
+
+    const f_type = buf[0];
+    return switch (f_type) {
+        0x01021997, // V9FS_MAGIC
+        0x6969, // NFS_SUPER_MAGIC
+        0xFF534D42, // CIFS_MAGIC_NUMBER
+        => false,
+        else => true,
+    };
+}
+
 pub const SqliteMemory = struct {
     db: ?*c.sqlite3,
     allocator: std.mem.Allocator,
@@ -31,6 +165,8 @@ pub const SqliteMemory = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, db_path: [*:0]const u8) !Self {
+        const use_wal = shouldUseWal(db_path);
+
         var db: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open(db_path, &db);
         if (rc != c.SQLITE_OK) {
@@ -43,7 +179,7 @@ pub const SqliteMemory = struct {
         }
 
         var self_ = Self{ .db = db, .allocator = allocator };
-        try self_.configurePragmas();
+        try self_.configurePragmas(use_wal);
         try self_.migrate();
         try self_.migrateSessionId();
         return self_;
@@ -70,10 +206,17 @@ pub const SqliteMemory = struct {
         log.warn("sqlite {s} failed (rc={d}, sql={s})", .{ context, rc, sql });
     }
 
-    fn configurePragmas(self: *Self) !void {
+    fn configurePragmas(self: *Self, use_wal: bool) !void {
         // Pragmas are tuning knobs; failure should not prevent startup.
+        const journal_pragma: [:0]const u8 = if (use_wal)
+            "PRAGMA journal_mode = WAL;"
+        else
+            "PRAGMA journal_mode = DELETE;";
+        if (!use_wal) {
+            log.info("filesystem does not support mmap; using DELETE journal mode instead of WAL", .{});
+        }
         const pragmas = [_][:0]const u8{
-            "PRAGMA journal_mode = WAL;",
+            journal_pragma,
             "PRAGMA synchronous  = NORMAL;",
             "PRAGMA temp_store   = MEMORY;",
             "PRAGMA cache_size   = -2000;",

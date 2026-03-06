@@ -11,6 +11,9 @@ const Atomic = @import("../portable_atomic.zig").Atomic;
 const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
 const TEXT_MESSAGE_DEBOUNCE_SECS: u64 = 3;
+// Telegram clients may split long messages below the 4096 hard limit.
+// Keep this threshold loose enough to catch real-world split chunks (~3.3k+).
+const TEXT_SPLIT_LIKELY_MIN_LEN: usize = 3000;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
 const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 16;
@@ -2919,8 +2922,9 @@ fn shouldDebounceTextMessage(self: *const TelegramChannel, msg: root.ChannelMess
     if (msg.message_id == null) return false;
     if (isSlashCommandMessage(msg.content)) return false;
 
-    // Telegram split chunks tend to be near the hard 4096-char limit.
-    if (msg.content.len >= 3800) return true;
+    // Telegram split chunks tend to be near the hard 4096-char limit, but
+    // in practice many clients emit chunk sizes around ~3.3k-3.6k.
+    if (msg.content.len >= TEXT_SPLIT_LIKELY_MIN_LEN) return true;
 
     // If a chain is already pending for this sender/chat, debounce follow-ups too.
     return pendingTextLatestSeenForKey(
@@ -4217,7 +4221,7 @@ test "telegram shouldDebounceTextMessage handles long chunk and active chain" {
     }
 
     const now = root.nowEpochSecs();
-    const long_content = try alloc.alloc(u8, 3800);
+    const long_content = try alloc.alloc(u8, TEXT_SPLIT_LIKELY_MIN_LEN);
     defer alloc.free(long_content);
     @memset(long_content, 'x');
 
@@ -4252,6 +4256,32 @@ test "telegram shouldDebounceTextMessage handles long chunk and active chain" {
     try ch.pending_text_received_at.append(alloc, now);
 
     try std.testing.expect(shouldDebounceTextMessage(&ch, short_msg));
+}
+
+test "telegram shouldDebounceTextMessage catches real-world ~3.4k split chunk" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+    defer {
+        ch.resetPendingTextBuffers();
+        ch.pending_text_messages.deinit(alloc);
+        ch.pending_text_received_at.deinit(alloc);
+    }
+
+    const now = root.nowEpochSecs();
+    const split_like_content = try alloc.alloc(u8, 3414);
+    defer alloc.free(split_like_content);
+    @memset(split_like_content, 'x');
+
+    const msg: root.ChannelMessage = .{
+        .id = "user-a",
+        .sender = "chat-a",
+        .content = split_like_content,
+        .channel = "telegram",
+        .timestamp = now,
+        .message_id = 100,
+    };
+
+    try std.testing.expect(shouldDebounceTextMessage(&ch, msg));
 }
 
 test "telegram mergeConsecutiveMessages non-consecutive ids not merged" {

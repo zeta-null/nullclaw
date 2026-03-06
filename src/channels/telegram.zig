@@ -10,6 +10,7 @@ const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
+const TEXT_MESSAGE_DEBOUNCE_SECS: u64 = 3;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
 const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 16;
@@ -304,6 +305,42 @@ fn nextPendingMediaDeadline(group_ids: []const ?[]const u8, received_at: []const
     return if (seen) next_deadline else null;
 }
 
+fn pendingTextLatestSeenForKey(
+    id: []const u8,
+    sender: []const u8,
+    pending_messages: []const root.ChannelMessage,
+    received_at: []const u64,
+) ?u64 {
+    const n = @min(pending_messages.len, received_at.len);
+    var seen = false;
+    var latest: u64 = 0;
+    for (0..n) |i| {
+        const msg = pending_messages[i];
+        if (!std.mem.eql(u8, msg.id, id) or !std.mem.eql(u8, msg.sender, sender)) continue;
+        if (!seen or received_at[i] > latest) latest = received_at[i];
+        seen = true;
+    }
+    return if (seen) latest else null;
+}
+
+fn nextPendingTextDeadline(pending_messages: []const root.ChannelMessage, received_at: []const u64) ?u64 {
+    const n = @min(pending_messages.len, received_at.len);
+    var seen = false;
+    var next_deadline: u64 = 0;
+    for (0..n) |i| {
+        const latest = pendingTextLatestSeenForKey(
+            pending_messages[i].id,
+            pending_messages[i].sender,
+            pending_messages,
+            received_at,
+        ) orelse continue;
+        const deadline = latest + TEXT_MESSAGE_DEBOUNCE_SECS;
+        if (!seen or deadline < next_deadline) next_deadline = deadline;
+        seen = true;
+    }
+    return if (seen) next_deadline else null;
+}
+
 fn sweepTempMediaFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) void {
     var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
@@ -469,6 +506,8 @@ pub const TelegramChannel = struct {
     pending_media_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty,
     pending_media_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty,
     pending_media_received_at: std.ArrayListUnmanaged(u64) = .empty,
+    pending_text_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty,
+    pending_text_received_at: std.ArrayListUnmanaged(u64) = .empty,
     polls_since_temp_sweep: u32 = 0,
 
     typing_mu: std.Thread.Mutex = .{},
@@ -832,7 +871,7 @@ pub const TelegramChannel = struct {
     /// If media-group updates are still buffered in-memory, persisting a newer
     /// offset can skip those updates after restart, so return null until flushed.
     pub fn persistableUpdateOffset(self: *const TelegramChannel) ?i64 {
-        if (self.pending_media_messages.items.len == 0) {
+        if (self.pending_media_messages.items.len == 0 and self.pending_text_messages.items.len == 0) {
             return self.last_update_id;
         }
         return null;
@@ -1623,6 +1662,14 @@ pub const TelegramChannel = struct {
         self.pending_media_received_at.clearRetainingCapacity();
     }
 
+    fn resetPendingTextBuffers(self: *TelegramChannel) void {
+        for (self.pending_text_messages.items) |msg| {
+            msg.deinit(self.allocator);
+        }
+        self.pending_text_messages.clearRetainingCapacity();
+        self.pending_text_received_at.clearRetainingCapacity();
+    }
+
     fn maybeSweepTempMediaFiles(self: *TelegramChannel) void {
         self.polls_since_temp_sweep += 1;
         if (self.polls_since_temp_sweep < TEMP_MEDIA_SWEEP_INTERVAL_POLLS) return;
@@ -1761,6 +1808,63 @@ pub const TelegramChannel = struct {
         moved_group_ids.clearRetainingCapacity();
     }
 
+    fn flushMaturedPendingTextMessages(
+        self: *TelegramChannel,
+        poll_allocator: std.mem.Allocator,
+        messages: *std.ArrayListUnmanaged(root.ChannelMessage),
+        media_group_ids: *std.ArrayListUnmanaged(?[]const u8),
+    ) void {
+        if (self.pending_text_messages.items.len == 0) return;
+        if (self.pending_text_messages.items.len != self.pending_text_received_at.items.len) {
+            log.warn("telegram pending text buffers out of sync; resetting buffers", .{});
+            self.resetPendingTextBuffers();
+            return;
+        }
+
+        const now = root.nowEpochSecs();
+
+        var i: usize = 0;
+        while (i < self.pending_text_messages.items.len) {
+            const msg = self.pending_text_messages.items[i];
+            const latest = pendingTextLatestSeenForKey(
+                msg.id,
+                msg.sender,
+                self.pending_text_messages.items,
+                self.pending_text_received_at.items,
+            ) orelse {
+                i += 1;
+                continue;
+            };
+            if (now < latest + TEXT_MESSAGE_DEBOUNCE_SECS) {
+                i += 1;
+                continue;
+            }
+
+            const pending_msg = self.pending_text_messages.orderedRemove(i);
+            _ = self.pending_text_received_at.orderedRemove(i);
+
+            const out_msg = cloneChannelMessage(poll_allocator, pending_msg) catch {
+                pending_msg.deinit(self.allocator);
+                continue;
+            };
+
+            messages.append(poll_allocator, out_msg) catch {
+                var tmp = out_msg;
+                tmp.deinit(poll_allocator);
+                pending_msg.deinit(self.allocator);
+                continue;
+            };
+            media_group_ids.append(poll_allocator, null) catch {
+                const popped = messages.pop().?;
+                var tmp = popped;
+                tmp.deinit(poll_allocator);
+                pending_msg.deinit(self.allocator);
+                continue;
+            };
+            pending_msg.deinit(self.allocator);
+        }
+    }
+
     fn buildGetUpdatesBody(buf: []u8, offset: i64, timeout_secs: u64) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         try fbs.writer().print(
@@ -1782,13 +1886,22 @@ pub const TelegramChannel = struct {
         self.cleanupExpiredInteractions();
 
         // Build body with offset and dynamic timeout.
-        // If pending media groups exist, cap timeout to the nearest group deadline.
+        // If pending media/text debounced buffers exist, cap timeout to nearest deadline.
         var poll_timeout: u64 = 30;
         {
             const t_now = root.nowEpochSecs();
+            var next_deadline: ?u64 = null;
+
             if (nextPendingMediaDeadline(self.pending_media_group_ids.items, self.pending_media_received_at.items)) |deadline| {
+                next_deadline = deadline;
+            }
+            if (nextPendingTextDeadline(self.pending_text_messages.items, self.pending_text_received_at.items)) |deadline| {
+                if (next_deadline == null or deadline < next_deadline.?) next_deadline = deadline;
+            }
+
+            if (next_deadline) |deadline| {
                 if (t_now >= deadline) {
-                    poll_timeout = 0; // Deadline already passed — return immediately
+                    poll_timeout = 0;
                 } else {
                     poll_timeout = @min(30, deadline - t_now);
                 }
@@ -1903,6 +2016,45 @@ pub const TelegramChannel = struct {
 
         // Flush again to emit groups that became mature in this cycle.
         self.flushMaturedPendingMediaGroups(allocator, &messages, &media_group_ids);
+
+        // Buffer non-command text messages across poll cycles to debounce split
+        // Telegram long messages that arrive in separate getUpdates responses.
+        {
+            var i: usize = 0;
+            while (i < messages.items.len) {
+                if (!shouldDebounceTextMessage(self, messages.items[i])) {
+                    i += 1;
+                    continue;
+                }
+
+                const msg = messages.orderedRemove(i);
+                const mgid = media_group_ids.orderedRemove(i);
+                if (mgid) |m| allocator.free(m);
+
+                const pending_msg = cloneChannelMessage(self.allocator, msg) catch {
+                    var tmp = msg;
+                    tmp.deinit(allocator);
+                    continue;
+                };
+                var tmp = msg;
+                tmp.deinit(allocator);
+
+                self.pending_text_messages.append(self.allocator, pending_msg) catch {
+                    var rollback = pending_msg;
+                    rollback.deinit(self.allocator);
+                    continue;
+                };
+                self.pending_text_received_at.append(self.allocator, root.nowEpochSecs()) catch {
+                    const popped_msg = self.pending_text_messages.pop().?;
+                    var rollback = popped_msg;
+                    rollback.deinit(self.allocator);
+                    continue;
+                };
+            }
+        }
+
+        // Flush text messages whose debounce window has fully elapsed.
+        self.flushMaturedPendingTextMessages(allocator, &messages, &media_group_ids);
 
         // Merge consecutive text messages to reconstruct long split texts
         // and debounce rapid-fire messages.
@@ -2351,9 +2503,12 @@ pub const TelegramChannel = struct {
         self.deinitDraftBuffers();
         // Clean up buffered media group messages to prevent shutdown leaks.
         self.resetPendingMediaBuffers();
+        self.resetPendingTextBuffers();
         self.pending_media_messages.deinit(self.allocator);
         self.pending_media_group_ids.deinit(self.allocator);
         self.pending_media_received_at.deinit(self.allocator);
+        self.pending_text_messages.deinit(self.allocator);
+        self.pending_text_received_at.deinit(self.allocator);
         if (self.bot_username) |name| {
             self.allocator.free(name);
             self.bot_username = null;
@@ -2758,6 +2913,22 @@ fn appendHtmlEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
 fn isSlashCommandMessage(content: []const u8) bool {
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
     return std.mem.startsWith(u8, trimmed, "/");
+}
+
+fn shouldDebounceTextMessage(self: *const TelegramChannel, msg: root.ChannelMessage) bool {
+    if (msg.message_id == null) return false;
+    if (isSlashCommandMessage(msg.content)) return false;
+
+    // Telegram split chunks tend to be near the hard 4096-char limit.
+    if (msg.content.len >= 3800) return true;
+
+    // If a chain is already pending for this sender/chat, debounce follow-ups too.
+    return pendingTextLatestSeenForKey(
+        msg.id,
+        msg.sender,
+        self.pending_text_messages.items,
+        self.pending_text_received_at.items,
+    ) != null;
 }
 
 fn mergeConsecutiveMessages(
@@ -4036,6 +4207,53 @@ test "telegram mergeConsecutiveMessages single message no-op" {
     try std.testing.expectEqualStrings("Hello", messages.items[0].content);
 }
 
+test "telegram shouldDebounceTextMessage handles long chunk and active chain" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+    defer {
+        ch.resetPendingTextBuffers();
+        ch.pending_text_messages.deinit(alloc);
+        ch.pending_text_received_at.deinit(alloc);
+    }
+
+    const now = root.nowEpochSecs();
+    const long_content = try alloc.alloc(u8, 3800);
+    defer alloc.free(long_content);
+    @memset(long_content, 'x');
+
+    const long_msg: root.ChannelMessage = .{
+        .id = "user-a",
+        .sender = "chat-a",
+        .content = long_content,
+        .channel = "telegram",
+        .timestamp = now,
+        .message_id = 1,
+    };
+    try std.testing.expect(shouldDebounceTextMessage(&ch, long_msg));
+
+    const short_msg: root.ChannelMessage = .{
+        .id = "user-a",
+        .sender = "chat-a",
+        .content = "short",
+        .channel = "telegram",
+        .timestamp = now,
+        .message_id = 2,
+    };
+    try std.testing.expect(!shouldDebounceTextMessage(&ch, short_msg));
+
+    try ch.pending_text_messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user-a"),
+        .sender = try alloc.dupe(u8, "chat-a"),
+        .content = try alloc.dupe(u8, "pending"),
+        .channel = "telegram",
+        .timestamp = now,
+        .message_id = 0,
+    });
+    try ch.pending_text_received_at.append(alloc, now);
+
+    try std.testing.expect(shouldDebounceTextMessage(&ch, short_msg));
+}
+
 test "telegram mergeConsecutiveMessages non-consecutive ids not merged" {
     const alloc = std.testing.allocator;
     var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
@@ -4227,6 +4445,89 @@ test "telegram persistableUpdateOffset waits until pending media flushes" {
     ch.pending_media_received_at.deinit(alloc);
 }
 
+test "telegram persistableUpdateOffset waits until pending text flushes" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+
+    ch.last_update_id = 42;
+    try std.testing.expectEqual(@as(?i64, 42), ch.persistableUpdateOffset());
+
+    const now = root.nowEpochSecs();
+    try ch.pending_text_messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user-a"),
+        .sender = try alloc.dupe(u8, "chat-a"),
+        .content = try alloc.dupe(u8, "part one"),
+        .channel = "telegram",
+        .timestamp = now,
+        .message_id = 1,
+    });
+    try ch.pending_text_received_at.append(alloc, now);
+
+    try std.testing.expect(ch.persistableUpdateOffset() == null);
+
+    ch.resetPendingTextBuffers();
+    ch.pending_text_messages.deinit(alloc);
+    ch.pending_text_received_at.deinit(alloc);
+}
+
+test "telegram flushMaturedPendingTextMessages waits for newest chain message" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+
+    const now = root.nowEpochSecs();
+
+    try ch.pending_text_messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user-a"),
+        .sender = try alloc.dupe(u8, "chat-a"),
+        .content = try alloc.dupe(u8, "part-1"),
+        .channel = "telegram",
+        .timestamp = now - 10,
+        .message_id = 1,
+    });
+    try ch.pending_text_received_at.append(alloc, now - 10);
+
+    try ch.pending_text_messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user-a"),
+        .sender = try alloc.dupe(u8, "chat-a"),
+        .content = try alloc.dupe(u8, "part-2"),
+        .channel = "telegram",
+        .timestamp = now,
+        .message_id = 2,
+    });
+    try ch.pending_text_received_at.append(alloc, now);
+
+    var out_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer {
+        for (out_messages.items) |msg| {
+            var tmp = msg;
+            tmp.deinit(alloc);
+        }
+        out_messages.deinit(alloc);
+    }
+    var out_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty;
+    defer {
+        for (out_group_ids.items) |mg| if (mg) |s| alloc.free(s);
+        out_group_ids.deinit(alloc);
+    }
+
+    ch.flushMaturedPendingTextMessages(alloc, &out_messages, &out_group_ids);
+
+    // Newest chain message is not mature yet, so both must remain pending.
+    try std.testing.expectEqual(@as(usize, 0), out_messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ch.pending_text_messages.items.len);
+
+    // Force chain maturity by moving the newest timestamp back.
+    ch.pending_text_received_at.items[1] = now - (TEXT_MESSAGE_DEBOUNCE_SECS + 1);
+    ch.flushMaturedPendingTextMessages(alloc, &out_messages, &out_group_ids);
+
+    try std.testing.expectEqual(@as(usize, 2), out_messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ch.pending_text_messages.items.len);
+
+    ch.resetPendingTextBuffers();
+    ch.pending_text_messages.deinit(alloc);
+    ch.pending_text_received_at.deinit(alloc);
+}
+
 test "telegram processUpdate falls back to caption when text is absent" {
     const alloc = std.testing.allocator;
     var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
@@ -4287,6 +4588,40 @@ test "telegram nextPendingMediaDeadline returns earliest group deadline" {
     const deadline = nextPendingMediaDeadline(group_ids[0..], received_at[0..]);
     try std.testing.expect(deadline != null);
     try std.testing.expectEqual(@as(u64, 10), deadline.?); // group-b latest=7 => 7+3
+}
+
+test "telegram nextPendingTextDeadline returns earliest chain deadline" {
+    const messages = [_]root.ChannelMessage{
+        .{
+            .id = "user-a",
+            .sender = "chat-a",
+            .content = "a1",
+            .channel = "telegram",
+            .timestamp = 0,
+            .message_id = 1,
+        },
+        .{
+            .id = "user-b",
+            .sender = "chat-b",
+            .content = "b1",
+            .channel = "telegram",
+            .timestamp = 0,
+            .message_id = 100,
+        },
+        .{
+            .id = "user-a",
+            .sender = "chat-a",
+            .content = "a2",
+            .channel = "telegram",
+            .timestamp = 0,
+            .message_id = 2,
+        },
+    };
+    const received_at = [_]u64{ 10, 9, 12 };
+
+    const deadline = nextPendingTextDeadline(messages[0..], received_at[0..]);
+    try std.testing.expect(deadline != null);
+    try std.testing.expectEqual(@as(u64, 12), deadline.?); // chat-b latest=9 => 9+3
 }
 
 test "telegram sweepTempMediaFilesInDir removes only stale nullclaw temp media files" {

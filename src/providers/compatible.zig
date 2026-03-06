@@ -691,7 +691,7 @@ pub const OpenAiCompatibleProvider = struct {
             .downstream_ctx = callback_ctx,
         };
 
-        var result = try sse.curlStream(
+        var result = sse.curlStream(
             allocator,
             url,
             body,
@@ -700,7 +700,22 @@ pub const OpenAiCompatibleProvider = struct {
             request.timeout_secs,
             streamThinkSanitizeCallback,
             @ptrCast(&sanitize_ctx),
-        );
+        ) catch |err| {
+            if (err == error.CurlWaitError or err == error.CurlFailed) {
+                log.warn("{s} streaming failed with {}; falling back to non-streaming response", .{ self.name, err });
+                const fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                if (fallback.content) |text| {
+                    callback(callback_ctx, root.StreamChunk.textDelta(text));
+                }
+                callback(callback_ctx, root.StreamChunk.finalChunk());
+                return .{
+                    .content = fallback.content,
+                    .usage = fallback.usage,
+                    .model = fallback.model,
+                };
+            }
+            return err;
+        };
 
         if (result.content) |raw| {
             const cleaned = try stripThinkBlocks(allocator, raw);

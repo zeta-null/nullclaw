@@ -146,7 +146,8 @@ fn curlRequestWithProxy(
         return error.CurlReadError;
     };
 
-    const term = child.wait() catch {
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
         allocator.free(stdout);
         return error.CurlWaitError;
     };
@@ -250,7 +251,10 @@ pub fn curlPostWithStatus(
     };
     errdefer allocator.free(stdout);
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
+        return error.CurlWaitError;
+    };
     switch (term) {
         .Exited => |code| if (code != 0) return error.CurlFailed,
         else => return error.CurlFailed,
@@ -345,7 +349,10 @@ fn curlGetWithProxyAndResolve(
         return error.CurlReadError;
     };
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
+        return error.CurlWaitError;
+    };
     switch (term) {
         .Exited => |code| if (code != 0) {
             allocator.free(stdout);
@@ -491,7 +498,8 @@ pub fn curlGetSSE(
         return error.CurlReadError;
     };
 
-    const term = child.wait() catch {
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
         allocator.free(stdout);
         return error.CurlWaitError;
     };

@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 64;
+pub const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 16;
 pub const DRAFT_FLUSH_MIN_INTERVAL_MS: i64 = 200;
 
 const DRAFT_TRIM_BYTES = " \t\r\n";

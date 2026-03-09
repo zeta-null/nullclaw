@@ -2707,6 +2707,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     try stdout.print("Gateway listening on {s}:{d}\n", .{ host, port });
     try stdout.flush();
     if (config_opt) |cfg| {
+        if (cfg.autonomy.level == .yolo) {
+            try stdout.print("\x1b[1;31m[WARNING] YOLO mode active — all security checks bypassed\x1b[0m\n", .{});
+            try stdout.flush();
+        }
         // In daemon mode the parent already prints model/provider.
         if (config_ptr == null) cfg.printModelConfig();
     }

@@ -809,6 +809,27 @@ pub const SlackChannel = struct {
 
     // ── Channel vtable ──────────────────────────────────────────────
 
+    fn appendPostMessageBody(
+        self: *SlackChannel,
+        body_list: *std.ArrayListUnmanaged(u8),
+        actual_channel: []const u8,
+        text: []const u8,
+    ) !void {
+        const mrkdwn_text = try markdownToSlackMrkdwn(self.allocator, text);
+        defer self.allocator.free(mrkdwn_text);
+
+        try body_list.appendSlice(self.allocator, "{\"channel\":\"");
+        try body_list.appendSlice(self.allocator, actual_channel);
+        try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
+        try root.json_util.appendJsonString(body_list, self.allocator, mrkdwn_text);
+        if (self.thread_ts) |tts| {
+            try body_list.appendSlice(self.allocator, ",\"thread_ts\":\"");
+            try body_list.appendSlice(self.allocator, tts);
+            try body_list.append(self.allocator, '"');
+        }
+        try body_list.append(self.allocator, '}');
+    }
+
     /// Send a message to a Slack channel via chat.postMessage API.
     /// The target may contain "channel_id:thread_ts" for threaded replies.
     pub fn sendMessage(self: *SlackChannel, target_channel: []const u8, text: []const u8) !void {
@@ -820,17 +841,7 @@ pub const SlackChannel = struct {
         // Build JSON body
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-
-        try body_list.appendSlice(self.allocator, "{\"channel\":\"");
-        try body_list.appendSlice(self.allocator, actual_channel);
-        try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
-        try root.json_util.appendJsonString(&body_list, self.allocator, text);
-        if (self.thread_ts) |tts| {
-            try body_list.appendSlice(self.allocator, ",\"thread_ts\":\"");
-            try body_list.appendSlice(self.allocator, tts);
-            try body_list.append(self.allocator, '"');
-        }
-        try body_list.append(self.allocator, '}');
+        try self.appendPostMessageBody(&body_list, actual_channel, text);
 
         // Build auth header: "Authorization: Bearer xoxb-..."
         var auth_buf: [512]u8 = undefined;
@@ -1686,6 +1697,27 @@ test "mrkdwn bullets with bold items" {
 test "slack channel vtable compiles" {
     const vt = SlackChannel.vtable;
     try std.testing.expect(@TypeOf(vt) == root.Channel.VTable);
+}
+
+test "sendMessage payload converts markdown to mrkdwn" {
+    const allowed = [_][]const u8{};
+    var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_list.deinit(std.testing.allocator);
+
+    try ch.appendPostMessageBody(&body_list, "C123", "**hello** world");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body_list.items, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+
+    const text_value = parsed.value.object.get("text") orelse return error.TestExpectedEqual;
+    try std.testing.expect(text_value == .string);
+    try std.testing.expectEqualStrings("*hello* world", text_value.string);
+
+    const mrkdwn_value = parsed.value.object.get("mrkdwn") orelse return error.TestExpectedEqual;
+    try std.testing.expect(mrkdwn_value == .bool and mrkdwn_value.bool);
 }
 
 test "slack channel interface returns slack name" {

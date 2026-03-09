@@ -9,6 +9,8 @@ pub const AutonomyLevel = enum {
     supervised,
     /// Full: autonomous execution within policy bounds
     full,
+    /// YOLO: bypasses all security checks (allowlist, syntax, risk, approval, rate limiting)
+    yolo,
 
     pub fn default() AutonomyLevel {
         return .supervised;
@@ -19,6 +21,7 @@ pub const AutonomyLevel = enum {
             .read_only => "readonly",
             .supervised => "supervised",
             .full => "full",
+            .yolo => "yolo",
         };
     }
 
@@ -26,6 +29,7 @@ pub const AutonomyLevel = enum {
         if (std.mem.eql(u8, s, "readonly") or std.mem.eql(u8, s, "read_only")) return .read_only;
         if (std.mem.eql(u8, s, "supervised")) return .supervised;
         if (std.mem.eql(u8, s, "full")) return .full;
+        if (std.mem.eql(u8, s, "yolo")) return .yolo;
         return null;
     }
 };
@@ -145,6 +149,7 @@ pub const SecurityPolicy = struct {
         command: []const u8,
         approved: bool,
     ) error{ CommandNotAllowed, HighRiskBlocked, ApprovalRequired }!CommandRiskLevel {
+        if (self.autonomy == .yolo) return .low;
         if (!self.isCommandAllowed(command)) {
             return error.CommandNotAllowed;
         }
@@ -173,6 +178,7 @@ pub const SecurityPolicy = struct {
 
     /// Check if a shell command is allowed.
     pub fn isCommandAllowed(self: *const SecurityPolicy, command: []const u8) bool {
+        if (self.autonomy == .yolo) return true;
         if (self.autonomy == .read_only) return false;
 
         // Reject oversized commands — never silently truncate
@@ -263,6 +269,7 @@ pub const SecurityPolicy = struct {
     /// Record an action and check if the rate limit has been exceeded.
     /// Returns true if the action is allowed, false if rate-limited.
     pub fn recordAction(self: *const SecurityPolicy) !bool {
+        if (self.autonomy == .yolo) return true;
         if (self.tracker) |tracker| {
             return tracker.recordAction();
         }
@@ -271,6 +278,7 @@ pub const SecurityPolicy = struct {
 
     /// Check if the rate limit would be exceeded without recording.
     pub fn isRateLimited(self: *const SecurityPolicy) bool {
+        if (self.autonomy == .yolo) return false;
         if (self.tracker) |tracker| {
             return tracker.isLimited();
         }
@@ -1583,4 +1591,66 @@ test "full autonomy wildcard: arbitrary commands allowed" {
     try std.testing.expect(p.isCommandAllowed("cargo build --release"));
     try std.testing.expect(p.isCommandAllowed("make all"));
     try std.testing.expect(p.isCommandAllowed("zig build test"));
+}
+
+// ── YOLO autonomy level tests ───────────────────────────────────
+
+test "yolo fromString returns yolo" {
+    try std.testing.expectEqual(AutonomyLevel.yolo, AutonomyLevel.fromString("yolo").?);
+}
+
+test "yolo toString returns yolo" {
+    try std.testing.expectEqualStrings("yolo", AutonomyLevel.yolo.toString());
+}
+
+test "yolo isCommandAllowed bypasses all syntax checks" {
+    const p = SecurityPolicy{ .autonomy = .yolo };
+    // Subshell expansion — blocked by full, allowed by yolo
+    try std.testing.expect(p.isCommandAllowed("echo $(whoami)"));
+    // Backtick expansion
+    try std.testing.expect(p.isCommandAllowed("echo `id`"));
+    // Output redirection
+    try std.testing.expect(p.isCommandAllowed("echo hi > /tmp/out"));
+    // Background &
+    try std.testing.expect(p.isCommandAllowed("sleep 1 &"));
+    // Process substitution
+    try std.testing.expect(p.isCommandAllowed("diff <(ls) <(ls /tmp)"));
+}
+
+test "yolo validateCommandExecution returns low for all commands" {
+    const p = SecurityPolicy{ .autonomy = .yolo };
+    // High-risk command — yolo bypasses entirely
+    const risk1 = try p.validateCommandExecution("sudo rm -rf /", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk1);
+    // Command not on any allowlist — yolo bypasses
+    const risk2 = try p.validateCommandExecution("python3 exploit.py", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk2);
+}
+
+test "yolo canAct returns true" {
+    const p = SecurityPolicy{ .autonomy = .yolo };
+    try std.testing.expect(p.canAct());
+}
+
+test "yolo recordAction bypasses rate limiting" {
+    var tracker = RateTracker.init(std.testing.allocator, 1);
+    defer tracker.deinit();
+    var p = SecurityPolicy{
+        .autonomy = .yolo,
+        .tracker = &tracker,
+    };
+    try std.testing.expect(try p.recordAction());
+    try std.testing.expect(try p.recordAction());
+    try std.testing.expect(try p.recordAction());
+}
+
+test "yolo isRateLimited always false" {
+    var tracker = RateTracker.init(std.testing.allocator, 1);
+    defer tracker.deinit();
+    var p = SecurityPolicy{
+        .autonomy = .yolo,
+        .tracker = &tracker,
+    };
+    _ = try tracker.recordAction();
+    try std.testing.expect(p.isRateLimited() == false);
 }

@@ -709,6 +709,7 @@ fn formatWhoAmI(self: anytype) ![]const u8 {
 
 fn parseReasoningEffort(raw: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(raw, "off")) return "";
+    if (std.ascii.eqlIgnoreCase(raw, "on")) return "medium";
     if (std.ascii.eqlIgnoreCase(raw, "minimal")) return "minimal";
     if (std.ascii.eqlIgnoreCase(raw, "low")) return "low";
     if (std.ascii.eqlIgnoreCase(raw, "medium")) return "medium";

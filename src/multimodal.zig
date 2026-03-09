@@ -28,6 +28,9 @@ pub const MultimodalConfig = struct {
     /// Directories from which local image reads are allowed.
     /// If empty, all local file reads are rejected (only URLs pass through).
     allowed_dirs: []const []const u8 = &.{},
+    /// When true, skip the allowed_dirs check entirely (yolo mode).
+    /// File size and MIME validation still apply.
+    skip_dir_check: bool = false,
 };
 
 pub const default_config = MultimodalConfig{};
@@ -166,22 +169,24 @@ pub fn readLocalImage(allocator: std.mem.Allocator, path: []const u8, config: Mu
     };
     defer allocator.free(resolved);
 
-    // Verify the resolved path is within an allowed directory
-    if (config.allowed_dirs.len == 0) return error.LocalReadNotAllowed;
-    const allowed = blk: {
-        for (config.allowed_dirs) |dir| {
-            const trimmed = std.mem.trimRight(u8, dir, "/\\");
-            if (trimmed.len == 0) continue;
-            if (path_security.pathStartsWith(resolved, trimmed)) break :blk true;
+    // Verify the resolved path is within an allowed directory (skipped in yolo mode).
+    if (!config.skip_dir_check) {
+        if (config.allowed_dirs.len == 0) return error.LocalReadNotAllowed;
+        const allowed = blk: {
+            for (config.allowed_dirs) |dir| {
+                const trimmed = std.mem.trimRight(u8, dir, "/\\");
+                if (trimmed.len == 0) continue;
+                if (path_security.pathStartsWith(resolved, trimmed)) break :blk true;
 
-            // Compare against canonicalized allowed dir too (/var -> /private/var on macOS).
-            const canonical = std.fs.realpathAlloc(allocator, trimmed) catch continue;
-            defer allocator.free(canonical);
-            if (path_security.pathStartsWith(resolved, canonical)) break :blk true;
-        }
-        break :blk false;
-    };
-    if (!allowed) return error.PathNotAllowed;
+                // Compare against canonicalized allowed dir too (/var -> /private/var on macOS).
+                const canonical = std.fs.realpathAlloc(allocator, trimmed) catch continue;
+                defer allocator.free(canonical);
+                if (path_security.pathStartsWith(resolved, canonical)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (!allowed) return error.PathNotAllowed;
+    }
 
     const file = std.fs.openFileAbsolute(resolved, .{}) catch return error.PathNotFound;
     return readFromFile(allocator, file, config.max_image_size_bytes);
@@ -785,6 +790,30 @@ test "readLocalImage rejects when no allowed_dirs" {
 
     const err = readLocalImage(std.testing.allocator, file_path, .{});
     try std.testing.expectError(error.LocalReadNotAllowed, err);
+}
+
+test "readLocalImage allows any path when skip_dir_check is set" {
+    // Create a real temp file with valid PNG header
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const png_header = "\x89PNG\x0d\x0a\x1a\x0a";
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.png", .data = png_header });
+
+    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "test.png" });
+    defer std.testing.allocator.free(file_path);
+
+    // With empty allowed_dirs and skip_dir_check=true, read should succeed
+    const result = try readLocalImage(std.testing.allocator, file_path, .{
+        .allowed_dirs = &.{},
+        .skip_dir_check = true,
+    });
+    defer std.testing.allocator.free(result.data);
+
+    try std.testing.expectEqualStrings("image/png", result.mime_type);
+    try std.testing.expect(result.data.len > 0);
 }
 
 test "prepareMessagesForProvider does not delete nullclaw temp image files" {

@@ -434,6 +434,7 @@ pub const ChannelRuntime = struct {
             .screenshot_enabled = true,
             .mcp_tools = mcp_tools,
             .agents = config.agents,
+            .configured_providers = config.providers,
             .fallback_api_key = resolved_key,
             .tools_config = config.tools,
             .allowed_paths = config.autonomy.allowed_paths,

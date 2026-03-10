@@ -273,7 +273,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.process.exit(1);
     };
 
-    // Check both sub_args and global args for --verbose flag 
+    // Check both sub_args and global args for --verbose flag
     var verbose = hasVerboseFlag(sub_args);
     if (!verbose) {
         // Also check global args for --verbose flag
@@ -1874,6 +1874,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
         .agents = config.agents,
+        .configured_providers = config.providers,
         .fallback_api_key = resolved_api_key,
         .tools_config = config.tools,
         .allowed_paths = config.autonomy.allowed_paths,
@@ -2195,6 +2196,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
         .agents = config.agents,
+        .configured_providers = config.providers,
         .fallback_api_key = resolved_api_key,
         .tools_config = config.tools,
         .allowed_paths = config.autonomy.allowed_paths,

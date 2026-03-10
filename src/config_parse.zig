@@ -28,7 +28,12 @@ fn parseApiKeyField(allocator: std.mem.Allocator, value: std.json.Value) !?[]con
     };
 }
 
-fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
+const PrimaryModelRef = struct {
+    provider: []const u8,
+    model: []const u8,
+};
+
+fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
     // Handle custom: prefix specially (e.g., "custom:https://example.com/v2/model")
     if (std.mem.startsWith(u8, primary, "custom:")) {
         // The format is "custom:<provider_url>/<model>" where <provider_url> may contain slashes.
@@ -74,25 +79,53 @@ fn parseNamedAgentObject(
 ) !?types.NamedAgentConfig {
     if (item != .object) return null;
 
-    const provider = item.object.get("provider") orelse return null;
-    if (provider != .string) return null;
-
-    const model_str: ?[]const u8 = blk: {
+    const provider_val = item.object.get("provider");
+    const resolved_ref: ?PrimaryModelRef = blk: {
         const m = item.object.get("model") orelse break :blk null;
-        if (m == .string) break :blk m.string;
+        if (provider_val) |pv| {
+            if (pv != .string) break :blk null;
+            if (m == .string) {
+                break :blk .{
+                    .provider = pv.string,
+                    .model = m.string,
+                };
+            }
+            if (m == .object) {
+                if (m.object.get("primary")) |mp| {
+                    if (mp == .string) {
+                        break :blk .{
+                            .provider = pv.string,
+                            .model = mp.string,
+                        };
+                    }
+                }
+            }
+            break :blk null;
+        }
+
+        if (m == .string) {
+            if (splitPrimaryModelRef(m.string)) |parsed_ref| {
+                break :blk parsed_ref;
+            }
+            break :blk null;
+        }
         if (m == .object) {
             if (m.object.get("primary")) |mp| {
-                if (mp == .string) break :blk mp.string;
+                if (mp == .string) {
+                    if (splitPrimaryModelRef(mp.string)) |parsed_ref| {
+                        break :blk parsed_ref;
+                    }
+                }
             }
         }
         break :blk null;
     };
-    if (model_str == null) return null;
+    if (resolved_ref == null) return null;
 
     var agent_cfg = types.NamedAgentConfig{
         .name = try allocator.dupe(u8, agent_name),
-        .provider = try allocator.dupe(u8, provider.string),
-        .model = try allocator.dupe(u8, model_str.?),
+        .provider = try allocator.dupe(u8, resolved_ref.?.provider),
+        .model = try allocator.dupe(u8, resolved_ref.?.model),
     };
     if (item.object.get("system_prompt")) |sp| {
         if (sp == .string) agent_cfg.system_prompt = try allocator.dupe(u8, sp.string);

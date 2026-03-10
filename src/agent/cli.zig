@@ -274,6 +274,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
         .agents = cfg.agents,
+        .configured_providers = cfg.providers,
         .fallback_api_key = resolved_api_key,
         .tools_config = cfg.tools,
         .allowed_paths = cfg.autonomy.allowed_paths,

@@ -2657,6 +2657,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .browser_enabled = cfg.browser.enabled,
                     .screenshot_enabled = true,
                     .agents = cfg.agents,
+                    .configured_providers = cfg.providers,
                     .fallback_api_key = resolved_api_key,
                     .allowed_paths = cfg.autonomy.allowed_paths,
                     .tools_config = cfg.tools,

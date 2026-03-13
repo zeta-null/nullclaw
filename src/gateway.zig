@@ -923,6 +923,14 @@ fn findMaxConfigByWebhookSecret(cfg: *const Config, secret: []const u8) ?*const 
     return null;
 }
 
+fn countMaxWebhookAccounts(cfg: *const Config) usize {
+    var count: usize = 0;
+    for (cfg.channels.max) |max_cfg| {
+        if (max_cfg.mode == .webhook) count += 1;
+    }
+    return count;
+}
+
 fn selectMaxConfig(
     cfg_opt: ?*const Config,
     target: []const u8,
@@ -933,31 +941,31 @@ fn selectMaxConfig(
     if (cfg.channels.max.len == 0) return null;
 
     if (parseQueryParam(target, "account_id")) |account_id| {
-        if (findMaxConfigByAccountId(cfg, account_id)) |max_cfg| {
-            return max_cfg;
-        }
+        return findMaxConfigByAccountId(cfg, account_id);
     }
     if (parseQueryParam(target, "account")) |account_id| {
-        if (findMaxConfigByAccountId(cfg, account_id)) |max_cfg| {
-            return max_cfg;
-        }
+        return findMaxConfigByAccountId(cfg, account_id);
     }
 
     if (secret_header) |raw_secret| {
         const secret = std.mem.trim(u8, raw_secret, " \t\r\n");
         if (secret.len > 0) {
-            if (findMaxConfigByWebhookSecret(cfg, secret)) |max_cfg| {
-                return max_cfg;
-            }
+            return findMaxConfigByWebhookSecret(cfg, secret);
         }
     }
 
-    if (cfg.channels.maxPrimary()) |primary| {
-        if (findMaxConfigByAccountId(cfg, primary.account_id)) |max_cfg| {
-            return max_cfg;
+    const webhook_count = countMaxWebhookAccounts(cfg);
+    if (webhook_count == 1) {
+        for (cfg.channels.max) |*max_cfg| {
+            if (max_cfg.mode == .webhook) return max_cfg;
         }
     }
-    return &cfg.channels.max[0];
+
+    if (cfg.channels.max.len == 1) {
+        return &cfg.channels.max[0];
+    }
+
+    return null;
 }
 
 fn hasLineSecrets(cfg: *const Config) bool {
@@ -3777,6 +3785,99 @@ test "selectMaxConfig picks account by query account_id" {
     }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectMaxConfig does not fall back when secret header is invalid" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "max-main",
+            .mode = .webhook,
+            .webhook_secret = "secret-a",
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "max-backup",
+            .mode = .webhook,
+            .webhook_secret = "secret-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max", "wrong-secret");
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected == null);
+}
+
+test "selectMaxConfig requires explicit routing when multiple webhook accounts exist" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "max-main",
+            .mode = .webhook,
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "max-backup",
+            .mode = .webhook,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max", null);
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected == null);
+}
+
+test "selectMaxConfig picks sole webhook account even when polling account exists" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "poller",
+            .bot_token = "max-poll",
+            .mode = .polling,
+        },
+        .{
+            .account_id = "webhook",
+            .bot_token = "max-webhook",
+            .mode = .webhook,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max", null);
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("webhook", selected.?.account_id);
 }
 
 test "selectWhatsAppConfig picks account by verify_token" {

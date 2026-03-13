@@ -299,6 +299,10 @@ var shared_interactions_mu: std.Thread.Mutex = .{};
 var shared_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty;
 var shared_interaction_seq: Atomic(u64) = Atomic(u64).init(1);
 
+fn sharedInteractionsAllocator() std.mem.Allocator {
+    return if (builtin.is_test) std.testing.allocator else std.heap.page_allocator;
+}
+
 pub fn setInteractiveOwnerContext(owner_identity: ?[]const u8) void {
     tls_interaction_owner_identity = owner_identity;
 }
@@ -655,53 +659,54 @@ pub const MaxChannel = struct {
         choices: []const root.Channel.OutboundChoice,
         message_text: []const u8,
     ) !void {
+        const interaction_allocator = sharedInteractionsAllocator();
         const now = root.nowEpochSecs();
         const ttl = self.interactive.ttl_secs;
 
-        var options = try self.allocator.alloc(PendingInteractionOption, choices.len);
+        var options = try interaction_allocator.alloc(PendingInteractionOption, choices.len);
         var built: usize = 0;
         errdefer {
-            for (options[0..built]) |opt| opt.deinit(self.allocator);
-            self.allocator.free(options);
+            for (options[0..built]) |opt| opt.deinit(interaction_allocator);
+            interaction_allocator.free(options);
         }
 
         for (choices, 0..) |choice, i| {
             options[i] = .{
-                .id = try self.allocator.dupe(u8, choice.id),
-                .label = try self.allocator.dupe(u8, choice.label),
-                .submit_text = try self.allocator.dupe(u8, choice.submit_text),
+                .id = try interaction_allocator.dupe(u8, choice.id),
+                .label = try interaction_allocator.dupe(u8, choice.label),
+                .submit_text = try interaction_allocator.dupe(u8, choice.submit_text),
             };
             built += 1;
         }
 
-        const key = try self.allocator.dupe(u8, token);
-        errdefer self.allocator.free(key);
+        const key = try interaction_allocator.dupe(u8, token);
+        errdefer interaction_allocator.free(key);
 
-        const chat_id_dup = try self.allocator.dupe(u8, chat_id);
-        errdefer self.allocator.free(chat_id_dup);
+        const chat_id_dup = try interaction_allocator.dupe(u8, chat_id);
+        errdefer interaction_allocator.free(chat_id_dup);
 
-        const account_id_dup = try self.allocator.dupe(u8, self.account_id);
-        errdefer self.allocator.free(account_id_dup);
+        const account_id_dup = try interaction_allocator.dupe(u8, self.account_id);
+        errdefer interaction_allocator.free(account_id_dup);
 
         const owner_dup = if (owner_identity) |owner|
-            try self.allocator.dupe(u8, owner)
+            try interaction_allocator.dupe(u8, owner)
         else
             null;
-        errdefer if (owner_dup) |owner| self.allocator.free(owner);
+        errdefer if (owner_dup) |owner| interaction_allocator.free(owner);
 
         const message_text_dup = if (message_text.len > 0)
-            try self.allocator.dupe(u8, message_text)
+            try interaction_allocator.dupe(u8, message_text)
         else
             null;
-        errdefer if (message_text_dup) |text| self.allocator.free(text);
+        errdefer if (message_text_dup) |text| interaction_allocator.free(text);
 
         shared_interactions_mu.lock();
         defer shared_interactions_mu.unlock();
 
         self.expireInteractionsLocked(now);
 
-        try shared_interactions.put(self.allocator, key, .{
-            .allocator = self.allocator,
+        try shared_interactions.put(interaction_allocator, key, .{
+            .allocator = interaction_allocator,
             .created_at = now,
             .expires_at = now + ttl,
             .account_id = account_id_dup,
@@ -714,6 +719,7 @@ pub const MaxChannel = struct {
     }
 
     fn expireInteractionsLocked(self: *MaxChannel, now: u64) void {
+        _ = self;
         while (true) {
             var expired_key: ?[]const u8 = null;
             var it = shared_interactions.iterator();
@@ -732,7 +738,7 @@ pub const MaxChannel = struct {
         }
 
         if (shared_interactions.count() == 0) {
-            shared_interactions.deinit(self.allocator);
+            shared_interactions.deinit(sharedInteractionsAllocator());
             shared_interactions = .empty;
         }
     }
@@ -805,7 +811,7 @@ pub const MaxChannel = struct {
         }
 
         if (shared_interactions.count() == 0) {
-            shared_interactions.deinit(self.allocator);
+            shared_interactions.deinit(sharedInteractionsAllocator());
             shared_interactions = .empty;
         }
     }

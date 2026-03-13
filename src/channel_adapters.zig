@@ -4,6 +4,7 @@ const channel_loop = @import("channel_loop.zig");
 const channels_root = @import("channels/root.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
+const max_mod = @import("channels/max.zig");
 const agent_routing = @import("agent_routing.zig");
 
 pub const PollingSpawnFn = *const fn (
@@ -48,6 +49,10 @@ pub const polling_descriptors = [_]PollingDescriptor{
     .{
         .channel_name = "matrix",
         .spawn = channel_loop.spawnMatrixPolling,
+    },
+    .{
+        .channel_name = "max",
+        .spawn = channel_loop.spawnMaxPolling,
     },
 };
 
@@ -219,6 +224,19 @@ fn deriveMaixcamPeer(input: InboundRouteInput, _: InboundMetadata) ?agent_routin
     return .{ .kind = .direct, .id = input.chat_id };
 }
 
+fn defaultMaxAccount(config: *const Config, _: []const u8) ?[]const u8 {
+    if (config.channels.maxPrimary()) |mc| return mc.account_id;
+    return null;
+}
+
+fn deriveMaxPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
+    const is_group = meta.is_group orelse false;
+    return .{
+        .kind = if (is_group) .group else .direct,
+        .id = if (is_group) input.chat_id else input.sender_id,
+    };
+}
+
 fn defaultWebAccount(config: *const Config, _: []const u8) ?[]const u8 {
     if (config.channels.webPrimary()) |wc| return wc.account_id;
     return null;
@@ -276,6 +294,11 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .default_account_id = defaultWebAccount,
         .derive_peer = deriveWebPeer,
     },
+    .{
+        .channel_name = "max",
+        .default_account_id = defaultMaxAccount,
+        .derive_peer = deriveMaxPeer,
+    },
 };
 
 pub fn findInboundRouteDescriptor(config: *const Config, channel_name: []const u8) ?*const InboundRouteDescriptor {
@@ -293,6 +316,7 @@ test "findPollingDescriptor returns known polling adapters" {
     try std.testing.expect(findPollingDescriptor("telegram") != null);
     try std.testing.expect(findPollingDescriptor("signal") != null);
     try std.testing.expect(findPollingDescriptor("matrix") != null);
+    try std.testing.expect(findPollingDescriptor("max") != null);
     try std.testing.expect(findPollingDescriptor("discord") == null);
 }
 

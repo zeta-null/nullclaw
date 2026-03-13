@@ -53,6 +53,7 @@ pub const SlackConfig = config_types.SlackConfig;
 pub const WebhookConfig = config_types.WebhookConfig;
 pub const IMessageConfig = config_types.IMessageConfig;
 pub const MatrixConfig = config_types.MatrixConfig;
+pub const MaxConfig = config_types.MaxConfig;
 pub const MattermostConfig = config_types.MattermostConfig;
 pub const WhatsAppConfig = config_types.WhatsAppConfig;
 pub const IrcConfig = config_types.IrcConfig;

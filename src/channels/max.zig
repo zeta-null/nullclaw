@@ -11,6 +11,7 @@ const config_types = @import("../config_types.zig");
 const max_api = @import("max_api.zig");
 const max_ingress = @import("max_ingress.zig");
 const thread_stacks = @import("../thread_stacks.zig");
+const streaming = @import("../streaming.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.max);
@@ -1015,6 +1016,33 @@ pub const MaxChannel = struct {
     fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
         const self: *MaxChannel = @ptrCast(@alignCast(ptr));
         try self.stopTyping(recipient);
+    }
+
+    // ── Streaming sink (for processMessageStreaming) ──────────────
+
+    pub const StreamCtx = struct {
+        max_ptr: *MaxChannel,
+        chat_id: []const u8,
+        filter: streaming.TagFilter = undefined,
+    };
+
+    fn streamCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
+        if (event.stage != .chunk or event.text.len == 0) return;
+        const ctx: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
+        ctx.max_ptr.handleSendEventChunk(ctx.chat_id, event.text) catch {};
+    }
+
+    /// Build a streaming sink backed by the given context.
+    /// Returns null if streaming is disabled. Caller owns the lifetime of `ctx`.
+    /// Chunks are filtered through a TagFilter to strip tool_call markup.
+    pub fn makeSink(self: *MaxChannel, ctx: *StreamCtx) ?streaming.Sink {
+        if (!self.streaming_enabled) return null;
+        const raw = streaming.Sink{
+            .callback = streamCallback,
+            .ctx = @ptrCast(ctx),
+        };
+        ctx.filter = streaming.TagFilter.init(raw);
+        return ctx.filter.sink();
     }
 
     pub const vtable = root.Channel.VTable{

@@ -30,6 +30,7 @@ const agent_bindings_config = @import("agent_bindings_config.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
+const max_mod = @import("channels/max.zig");
 const channels_mod = @import("channels/root.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
 
@@ -1648,10 +1649,31 @@ pub const MatrixLoopState = struct {
     }
 };
 
+// ════════════════════════════════════════════════════════════════════════════
+// MaxLoopState — shared state between supervisor and polling thread
+// ════════════════════════════════════════════════════════════════════════════
+
+pub const MaxLoopState = struct {
+    /// Updated after each pollUpdates() — epoch seconds.
+    last_activity: Atomic(i64),
+    /// Supervisor sets this to ask the polling thread to stop.
+    stop_requested: Atomic(bool),
+    /// Thread handle for join().
+    thread: ?std.Thread = null,
+
+    pub fn init() MaxLoopState {
+        return .{
+            .last_activity = Atomic(i64).init(std.time.timestamp()),
+            .stop_requested = Atomic(bool).init(false),
+        };
+    }
+};
+
 pub const PollingState = union(enum) {
     telegram: *TelegramLoopState,
     signal: *SignalLoopState,
     matrix: *MatrixLoopState,
+    max: *MaxLoopState,
 };
 
 pub const PollingSpawnResult = struct {
@@ -1827,6 +1849,154 @@ pub fn runMatrixLoop(
     }
 }
 
+pub fn spawnMaxPolling(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    channel: channels_mod.Channel,
+) !PollingSpawnResult {
+    const mx_ls = try allocator.create(MaxLoopState);
+    errdefer allocator.destroy(mx_ls);
+    mx_ls.* = MaxLoopState.init();
+
+    const mx_ptr: *max_mod.MaxChannel = @ptrCast(@alignCast(channel.ptr));
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+        runMaxLoop,
+        .{ allocator, config, runtime, mx_ls, mx_ptr },
+    );
+    mx_ls.thread = thread;
+
+    return .{
+        .thread = thread,
+        .state = .{ .max = mx_ls },
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// runMaxLoop — polling thread function
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Thread-entry function for Max Bot API long-polling.
+/// Uses account-aware route resolution and per-chat reply targets.
+pub fn runMaxLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *MaxLoopState,
+    mx_ptr: *max_mod.MaxChannel,
+) void {
+    // 1. Fetch bot identity
+    mx_ptr.channel().start() catch |err| {
+        log.err("Max channel start failed: {}", .{err});
+        return;
+    };
+    defer mx_ptr.channel().stop();
+
+    loop_state.last_activity.store(std.time.timestamp(), .release);
+
+    var evict_counter: u32 = 0;
+    var backoff_ns: u64 = std.time.ns_per_s;
+    const max_backoff_ns: u64 = 30 * std.time.ns_per_s;
+
+    while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        const messages = mx_ptr.pollUpdates(allocator) catch |err| {
+            log.warn("Max poll error: {}", .{err});
+            loop_state.last_activity.store(std.time.timestamp(), .release);
+            std.Thread.sleep(backoff_ns);
+            backoff_ns = @min(backoff_ns * 2, max_backoff_ns);
+            continue;
+        };
+
+        // Reset backoff on success
+        backoff_ns = std.time.ns_per_s;
+        loop_state.last_activity.store(std.time.timestamp(), .release);
+
+        for (messages) |msg| {
+            const reply_target = msg.reply_target orelse msg.sender;
+            setScheduleToolContext(runtime.tools, "max", mx_ptr.account_id, reply_target);
+            defer setScheduleToolContext(runtime.tools, null, null, null);
+
+            var key_buf: [192]u8 = undefined;
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
+
+            const session_key = blk: {
+                const peer_id = reply_target;
+                const route = agent_routing.resolveRouteWithSession(allocator, .{
+                    .channel = "max",
+                    .account_id = mx_ptr.account_id,
+                    .peer = .{
+                        .kind = if (msg.is_group) .group else .direct,
+                        .id = peer_id,
+                    },
+                }, config.agent_bindings, config.agents, config.session) catch break :blk if (msg.is_group)
+                    std.fmt.bufPrint(&key_buf, "max:{s}:chat:{s}", .{ mx_ptr.account_id, peer_id }) catch msg.sender
+                else
+                    std.fmt.bufPrint(&key_buf, "max:{s}:{s}", .{ mx_ptr.account_id, msg.sender }) catch msg.sender;
+
+                allocator.free(route.main_session_key);
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
+            };
+
+            mx_ptr.startTyping(reply_target) catch {};
+            defer mx_ptr.stopTyping(reply_target) catch {};
+
+            const conversation_context: ?ConversationContext = .{
+                .channel = "max",
+                .is_group = msg.is_group,
+                .group_id = if (msg.is_group) reply_target else null,
+            };
+
+            var stream_ctx = max_mod.MaxChannel.StreamCtx{
+                .max_ptr = mx_ptr,
+                .chat_id = reply_target,
+            };
+            const sink = mx_ptr.makeSink(&stream_ctx);
+
+            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink) catch |err| {
+                log.err("Max agent error: {}", .{err});
+                const err_msg: []const u8 = switch (err) {
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+                    error.NoResponseContent => "Model returned an empty response. Please try again.",
+                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+                    error.OutOfMemory => "Out of memory.",
+                    else => "An error occurred. Try again.",
+                };
+                mx_ptr.sendMessage(reply_target, err_msg) catch |send_err| log.err("failed to send max error reply: {}", .{send_err});
+                continue;
+            };
+            defer allocator.free(reply);
+
+            if (shouldSuppressGroupReply(msg.is_group, reply)) {
+                log.info("Smart reply: skipping non-essential message", .{});
+                continue;
+            }
+
+            mx_ptr.sendMessage(reply_target, reply) catch |err| {
+                log.warn("Max send error: {}", .{err});
+            };
+        }
+
+        if (messages.len > 0) {
+            for (messages) |msg| {
+                msg.deinit(allocator);
+            }
+            allocator.free(messages);
+        }
+
+        evict_counter += 1;
+        if (evict_counter >= 100) {
+            evict_counter = 0;
+            _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
+        }
+
+        health.markComponentOk("max");
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -1970,6 +2140,29 @@ test "MatrixLoopState stop_requested toggle" {
 
 test "MatrixLoopState last_activity update" {
     var state = MatrixLoopState.init();
+    const before = state.last_activity.load(.acquire);
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    state.last_activity.store(std.time.timestamp(), .release);
+    const after = state.last_activity.load(.acquire);
+    try std.testing.expect(after >= before);
+}
+
+test "MaxLoopState init defaults" {
+    const state = MaxLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    try std.testing.expect(state.thread == null);
+    try std.testing.expect(state.last_activity.load(.acquire) > 0);
+}
+
+test "MaxLoopState stop_requested toggle" {
+    var state = MaxLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    state.stop_requested.store(true, .release);
+    try std.testing.expect(state.stop_requested.load(.acquire));
+}
+
+test "MaxLoopState last_activity update" {
+    var state = MaxLoopState.init();
     const before = state.last_activity.load(.acquire);
     std.Thread.sleep(10 * std.time.ns_per_ms);
     state.last_activity.store(std.time.timestamp(), .release);

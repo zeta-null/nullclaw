@@ -354,88 +354,137 @@ pub const LarkChannel = struct {
         return self.allocator.dupe(u8, token_val.string);
     }
 
-    /// Send a message to a Lark chat via the Open API.
-    /// POST /im/v1/messages?receive_id_type=chat_id
-    /// On 401, invalidates cached token and retries once.
-    pub fn sendMessage(self: *LarkChannel, recipient: []const u8, text: []const u8) !void {
+    /// POST body to url with Lark bearer auth, retrying once on 401 token expiry.
+    fn postWithTokenRetry(self: *LarkChannel, url: []const u8, body: []const u8) !void {
         const token = try self.getTenantAccessToken();
         defer self.allocator.free(token);
 
-        const base = self.apiBase();
-
-        // Build URL
-        var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/im/v1/messages?receive_id_type=chat_id", .{base});
-        const url = url_fbs.getWritten();
-
-        // Build inner content JSON: {"text":"..."}
-        var content_buf: [4096]u8 = undefined;
-        var content_fbs = std.io.fixedBufferStream(&content_buf);
-        const cw = content_fbs.writer();
-        try cw.writeAll("{\"text\":");
-        try root.appendJsonStringW(cw, text);
-        try cw.writeAll("}");
-        const content_json = content_fbs.getWritten();
-
-        // Build outer body JSON
-        var body_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&body_buf);
-        const w = fbs.writer();
-        try w.writeAll("{\"receive_id\":\"");
-        try w.writeAll(recipient);
-        try w.writeAll("\",\"msg_type\":\"text\",\"content\":");
-        // Escape the content JSON string for embedding
-        try root.appendJsonStringW(w, content_json);
-        try w.writeAll("}");
-        const body = fbs.getWritten();
-
-        // Build auth header
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Bearer {s}", .{token});
-        const auth_value = auth_fbs.getWritten();
-
+        const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return error.LarkApiError;
         var auth_header_buf: [576]u8 = undefined;
         const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
-        const send_resp = http_util.curlPostWithStatus(
-            self.allocator,
-            url,
-            body,
-            &.{auth_header},
-        ) catch return error.LarkApiError;
-        defer self.allocator.free(send_resp.body);
 
-        if (send_resp.status_code == 401) {
-            // Token expired — invalidate cache and retry once
+        const resp = http_util.curlPostWithStatus(self.allocator, url, body, &.{auth_header}) catch return error.LarkApiError;
+        defer self.allocator.free(resp.body);
+
+        if (resp.status_code == 401) {
             self.invalidateToken();
             const new_token = self.getTenantAccessToken() catch return error.LarkApiError;
             defer self.allocator.free(new_token);
 
-            var retry_auth_buf: [512]u8 = undefined;
-            var retry_auth_fbs = std.io.fixedBufferStream(&retry_auth_buf);
-            try retry_auth_fbs.writer().print("Bearer {s}", .{new_token});
-            const retry_auth_value = retry_auth_fbs.getWritten();
+            var retry_buf: [512]u8 = undefined;
+            const retry_value = std.fmt.bufPrint(&retry_buf, "Bearer {s}", .{new_token}) catch return error.LarkApiError;
+            var retry_header_buf: [576]u8 = undefined;
+            const retry_header = std.fmt.bufPrint(&retry_header_buf, "Authorization: {s}", .{retry_value}) catch return error.LarkApiError;
 
-            var retry_auth_header_buf: [576]u8 = undefined;
-            const retry_auth_header = std.fmt.bufPrint(&retry_auth_header_buf, "Authorization: {s}", .{retry_auth_value}) catch return error.LarkApiError;
-            const retry_resp = http_util.curlPostWithStatus(
-                self.allocator,
-                url,
-                body,
-                &.{retry_auth_header},
-            ) catch return error.LarkApiError;
+            const retry_resp = http_util.curlPostWithStatus(self.allocator, url, body, &.{retry_header}) catch return error.LarkApiError;
             defer self.allocator.free(retry_resp.body);
 
-            if (!statusCodeIsSuccess(retry_resp.status_code)) {
-                return error.LarkApiError;
-            }
+            if (!statusCodeIsSuccess(retry_resp.status_code)) return error.LarkApiError;
             return;
         }
 
-        if (!statusCodeIsSuccess(send_resp.status_code)) {
-            return error.LarkApiError;
+        if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
+    }
+
+    /// Send a plain text message to a Lark chat via the Open API.
+    /// POST /im/v1/messages?receive_id_type=chat_id
+    pub fn sendMessage(self: *LarkChannel, recipient: []const u8, text: []const u8) !void {
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/im/v1/messages?receive_id_type=chat_id", .{self.apiBase()});
+        const url = url_fbs.getWritten();
+
+        var content_buf: [4096]u8 = undefined;
+        var content_fbs = std.io.fixedBufferStream(&content_buf);
+        try content_fbs.writer().writeAll("{\"text\":");
+        try root.appendJsonStringW(content_fbs.writer(), text);
+        try content_fbs.writer().writeAll("}");
+
+        var body_buf: [8192]u8 = undefined;
+        var body_fbs = std.io.fixedBufferStream(&body_buf);
+        const w = body_fbs.writer();
+        try w.writeAll("{\"receive_id\":\"");
+        try w.writeAll(recipient);
+        try w.writeAll("\",\"msg_type\":\"text\",\"content\":");
+        try root.appendJsonStringW(w, content_fbs.getWritten());
+        try w.writeAll("}");
+
+        try self.postWithTokenRetry(url, body_fbs.getWritten());
+    }
+
+    /// Send a rich interactive card to a Lark chat via the Open API.
+    /// Renders as a Lark Card 2.0 (schema 2.0) interactive message.
+    pub fn sendRichMessage(self: *LarkChannel, recipient: []const u8, payload: root.OutboundPayload) !void {
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/im/v1/messages?receive_id_type=chat_id", .{self.apiBase()});
+        const url = url_fbs.getWritten();
+
+        // Build Lark Card 2.0 JSON
+        var card_buf: [16384]u8 = undefined;
+        var card_fbs = std.io.fixedBufferStream(&card_buf);
+        const cw = card_fbs.writer();
+
+        try cw.writeAll("{\"schema\":\"2.0\"");
+        if (payload.card_title.len > 0) {
+            try cw.writeAll(",\"header\":{\"title\":{\"tag\":\"plain_text\",\"content\":");
+            try root.appendJsonStringW(cw, payload.card_title);
+            try cw.writeAll("}}");
         }
+        try cw.writeAll(",\"body\":{\"elements\":[");
+        var first_elem = true;
+
+        if (payload.text.len > 0) {
+            first_elem = false;
+            try cw.writeAll("{\"tag\":\"div\",\"text\":{\"tag\":\"lark_md\",\"content\":");
+            try root.appendJsonStringW(cw, payload.text);
+            try cw.writeAll("}}");
+        }
+        for (payload.card_sections) |sec| {
+            if (!first_elem) try cw.writeByte(',');
+            first_elem = false;
+            var sec_buf: [4096]u8 = undefined;
+            var sec_fbs = std.io.fixedBufferStream(&sec_buf);
+            if (sec.title.len > 0) {
+                try sec_fbs.writer().print("**{s}**\n{s}", .{ sec.title, sec.body });
+            } else {
+                try sec_fbs.writer().writeAll(sec.body);
+            }
+            try cw.writeAll("{\"tag\":\"div\",\"text\":{\"tag\":\"lark_md\",\"content\":");
+            try root.appendJsonStringW(cw, sec_fbs.getWritten());
+            try cw.writeAll("}}");
+        }
+        for (payload.action_groups) |grp| {
+            if (grp.actions.len == 0) continue;
+            if (!first_elem) try cw.writeByte(',');
+            first_elem = false;
+            try cw.writeAll("{\"tag\":\"action\",\"actions\":[");
+            var first_btn = true;
+            for (grp.actions) |btn| {
+                if (!first_btn) try cw.writeByte(',');
+                first_btn = false;
+                try cw.writeAll("{\"tag\":\"button\",\"text\":{\"tag\":\"plain_text\",\"content\":");
+                try root.appendJsonStringW(cw, btn.label);
+                try cw.writeAll("},\"type\":\"primary\",\"value\":{\"id\":");
+                try root.appendJsonStringW(cw, btn.id);
+                try cw.writeAll("}}");
+            }
+            try cw.writeAll("]}");
+        }
+        try cw.writeAll("]}}");
+
+        // Outer body: {"receive_id":"...","msg_type":"interactive","content":"<card_json>"}
+        var body_buf: [20480]u8 = undefined;
+        var body_fbs = std.io.fixedBufferStream(&body_buf);
+        const bw = body_fbs.writer();
+        try bw.writeAll("{\"receive_id\":\"");
+        try bw.writeAll(recipient);
+        try bw.writeAll("\",\"msg_type\":\"interactive\",\"content\":");
+        try root.appendJsonStringW(bw, card_fbs.getWritten());
+        try bw.writeAll("}");
+
+        try self.postWithTokenRetry(url, body_fbs.getWritten());
     }
 
     fn buildWebsocketConfigUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
@@ -829,6 +878,11 @@ pub const LarkChannel = struct {
         try self.sendMessage(target, message);
     }
 
+    fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.OutboundPayload) anyerror!void {
+        const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        try self.sendRichMessage(target, payload);
+    }
+
     fn vtableName(ptr: *anyopaque) []const u8 {
         const self: *LarkChannel = @ptrCast(@alignCast(ptr));
         return self.channelName();
@@ -843,6 +897,7 @@ pub const LarkChannel = struct {
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
+        .sendRich = &vtableSendRich,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
     };

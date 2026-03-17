@@ -445,15 +445,26 @@ pub const Memory = struct {
             return func(self.ptr, allocator, key, session_id);
         }
 
-        const entry = try self.vtable.get(self.ptr, allocator, key);
-        if (session_id == null or entry == null) return entry;
-
-        errdefer if (entry) |value| value.deinit(allocator);
-        if (entry.?.session_id) |entry_session_id| {
-            if (std.mem.eql(u8, entry_session_id, session_id.?)) return entry;
+        if (session_id == null) {
+            return self.vtable.get(self.ptr, allocator, key);
         }
-        entry.?.deinit(allocator);
-        return null;
+
+        const entries = try self.vtable.list(self.ptr, allocator, null, session_id);
+        defer allocator.free(entries);
+
+        var found: ?MemoryEntry = null;
+        errdefer if (found) |value| value.deinit(allocator);
+
+        for (entries) |*entry_ptr| {
+            if (std.mem.eql(u8, entry_ptr.key, key)) {
+                if (found) |*prev| prev.deinit(allocator);
+                found = entry_ptr.*;
+            } else {
+                @constCast(entry_ptr).deinit(allocator);
+            }
+        }
+
+        return found;
     }
 
     pub fn list(self: Memory, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) ![]MemoryEntry {
@@ -469,10 +480,9 @@ pub const Memory = struct {
             return func(self.ptr, key, session_id);
         }
 
-        if (session_id) |scoped_session_id| {
-            const entry = try self.getScoped(allocator, key, scoped_session_id);
-            defer if (entry) |value| value.deinit(allocator);
-            if (entry == null) return false;
+        _ = allocator;
+        if (session_id != null) {
+            return error.NotSupported;
         }
         return self.vtable.forget(self.ptr, key);
     }
@@ -650,6 +660,7 @@ pub const MemoryRuntime = struct {
         vs.delete(encoded_key) catch |err| {
             log.warn("vector store delete failed for key '{s}': {}", .{ encoded_key, err });
         };
+        deleteLegacyVectorKey(vs, encoded_key, "vector store delete") catch {};
     }
 
     /// Rebuild the entire vector store from primary memory entries.
@@ -686,6 +697,7 @@ pub const MemoryRuntime = struct {
                 log.warn("reindex: upsert failed for key '{s}': {}", .{ encoded_key, err });
                 continue;
             };
+            deleteLegacyVectorKey(vs, encoded_key, "reindex cleanup") catch {};
             reindexed += 1;
         }
 
@@ -808,6 +820,16 @@ fn syncVectorUpsertWithComponents(
 
     vs.upsert(encoded_key, emb) catch |err| {
         log.warn("{s}vector sync upsert failed for key '{s}': {}", .{ log_prefix, encoded_key, err });
+        return;
+    };
+    deleteLegacyVectorKey(vs, encoded_key, "vector legacy cleanup") catch {};
+}
+
+fn deleteLegacyVectorKey(vs: vector_store.VectorStore, encoded_key: []const u8, log_prefix: []const u8) !void {
+    const decoded = vector_key.decode(encoded_key);
+    if (decoded.is_legacy) return;
+    vs.delete(decoded.logical_key) catch |err| {
+        log.warn("{s} failed for legacy key '{s}': {}", .{ log_prefix, decoded.logical_key, err });
     };
 }
 
@@ -1452,6 +1474,131 @@ test "Memory convenience list accepts session_id" {
     const results2 = try m.list(std.testing.allocator, .core, "session-abc");
     defer std.testing.allocator.free(results2);
     try std.testing.expectEqual(@as(usize, 0), results2.len);
+}
+
+test "Memory getScoped fallback uses scoped list when backend lacks native getter" {
+    const TestMemory = struct {
+        fn makeEntry(allocator: std.mem.Allocator, key: []const u8, content: []const u8, session_id: ?[]const u8) !MemoryEntry {
+            return .{
+                .id = try allocator.dupe(u8, key),
+                .key = try allocator.dupe(u8, key),
+                .content = try allocator.dupe(u8, content),
+                .category = .core,
+                .timestamp = try allocator.dupe(u8, "now"),
+                .session_id = if (session_id) |sid| try allocator.dupe(u8, sid) else null,
+                .score = null,
+            };
+        }
+
+        fn implName(_: *anyopaque) []const u8 {
+            return "fallback";
+        }
+
+        fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: MemoryCategory, _: ?[]const u8) anyerror!void {}
+
+        fn implRecall(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize, _: ?[]const u8) anyerror![]MemoryEntry {
+            return allocator.alloc(MemoryEntry, 0);
+        }
+
+        fn implGet(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror!?MemoryEntry {
+            return try makeEntry(allocator, "shared", "global", null);
+        }
+
+        fn implList(_: *anyopaque, allocator: std.mem.Allocator, _: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
+            if (session_id == null) return allocator.alloc(MemoryEntry, 0);
+            var entries = try allocator.alloc(MemoryEntry, 1);
+            entries[0] = try makeEntry(allocator, "shared", "scoped", session_id);
+            return entries;
+        }
+
+        fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
+            return true;
+        }
+
+        fn implCount(_: *anyopaque) anyerror!usize {
+            return 0;
+        }
+
+        fn implHealthCheck(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn implDeinit(_: *anyopaque) void {}
+
+        const vtable = Memory.VTable{
+            .name = &implName,
+            .store = &implStore,
+            .recall = &implRecall,
+            .get = &implGet,
+            .list = &implList,
+            .forget = &implForget,
+            .count = &implCount,
+            .healthCheck = &implHealthCheck,
+            .deinit = &implDeinit,
+        };
+    };
+
+    const mem = Memory{ .ptr = undefined, .vtable = &TestMemory.vtable };
+    const entry = (try mem.getScoped(std.testing.allocator, "shared", "sess-a")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("scoped", entry.content);
+    try std.testing.expectEqualStrings("sess-a", entry.session_id.?);
+}
+
+test "Memory forgetScoped fallback fails closed without native support" {
+    const TestMemory = struct {
+        var forget_calls: usize = 0;
+
+        fn implName(_: *anyopaque) []const u8 {
+            return "fallback";
+        }
+
+        fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: MemoryCategory, _: ?[]const u8) anyerror!void {}
+
+        fn implRecall(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize, _: ?[]const u8) anyerror![]MemoryEntry {
+            return allocator.alloc(MemoryEntry, 0);
+        }
+
+        fn implGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?MemoryEntry {
+            return null;
+        }
+
+        fn implList(_: *anyopaque, allocator: std.mem.Allocator, _: ?MemoryCategory, _: ?[]const u8) anyerror![]MemoryEntry {
+            return allocator.alloc(MemoryEntry, 0);
+        }
+
+        fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
+            forget_calls += 1;
+            return true;
+        }
+
+        fn implCount(_: *anyopaque) anyerror!usize {
+            return 0;
+        }
+
+        fn implHealthCheck(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn implDeinit(_: *anyopaque) void {}
+
+        const vtable = Memory.VTable{
+            .name = &implName,
+            .store = &implStore,
+            .recall = &implRecall,
+            .get = &implGet,
+            .list = &implList,
+            .forget = &implForget,
+            .count = &implCount,
+            .healthCheck = &implHealthCheck,
+            .deinit = &implDeinit,
+        };
+    };
+
+    const mem = Memory{ .ptr = undefined, .vtable = &TestMemory.vtable };
+    TestMemory.forget_calls = 0;
+    try std.testing.expectError(error.NotSupported, mem.forgetScoped(std.testing.allocator, "shared", "sess-a"));
+    try std.testing.expectEqual(@as(usize, 0), TestMemory.forget_calls);
 }
 
 test "SessionStore delegates through vtable" {

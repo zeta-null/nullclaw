@@ -1194,7 +1194,7 @@ pub const Config = struct {
             },
             .{
                 .name = "MEMORY.md",
-                .content = "# Memory\n\nKeep durable notes for this agent here.\n",
+                .content = "# Memory\n",
             },
         };
 
@@ -3457,6 +3457,28 @@ test "resolveAgentWorkspace resolves relative path against config directory" {
     const resolved = try cfg.resolveAgentWorkspace(allocator, "coder");
     defer allocator.free(resolved);
     try std.testing.expectEqualStrings(expected_workspace, resolved);
+}
+
+test "scaffoldAgentWorkspace leaves markdown memory empty" {
+    const allocator = std.testing.allocator;
+    const markdown = @import("memory/engines/markdown.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "agents", "writer" });
+    defer allocator.free(workspace);
+
+    try Config.scaffoldAgentWorkspace(allocator, workspace);
+
+    var mem = try markdown.MarkdownMemory.init(allocator, workspace);
+    defer mem.deinit();
+
+    const entries = try mem.memory().list(allocator, null, null);
+    defer @import("memory/root.zig").freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
 }
 
 test "parse agents object-of-objects shape" {

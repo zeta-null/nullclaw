@@ -702,8 +702,9 @@ fn vectorResultsToCandidates(
 
     for (vec_results) |vr| {
         const decoded = key_codec.decode(vr.key);
+        if (decoded.is_legacy) continue;
         if (session_id) |sid| {
-            if (decoded.session_id == null or decoded.is_legacy) continue;
+            if (decoded.session_id == null) continue;
             if (!std.mem.eql(u8, decoded.session_id.?, sid)) continue;
         }
 
@@ -1139,6 +1140,26 @@ test "vectorResultsToCandidates filters scoped session" {
     try std.testing.expectEqual(@as(usize, 1), candidates.len);
     try std.testing.expectEqualStrings("shared", candidates[0].key);
     try std.testing.expect(candidates[0].vector_score != null);
+    try std.testing.expect(@abs(candidates[0].vector_score.? - 0.85) < 0.001);
+}
+
+test "vectorResultsToCandidates drops legacy results for unscoped search" {
+    const allocator = std.testing.allocator;
+    const encoded = try key_codec.encode(allocator, "shared", null);
+    defer allocator.free(encoded);
+    const legacy = try allocator.dupe(u8, "shared");
+    defer allocator.free(legacy);
+
+    const vec_results = [_]vector_store_mod.VectorResult{
+        .{ .key = legacy, .score = 0.95 },
+        .{ .key = encoded, .score = 0.85 },
+    };
+
+    const candidates = try vectorResultsToCandidates(allocator, &vec_results, null);
+    defer freeCandidates(allocator, candidates);
+
+    try std.testing.expectEqual(@as(usize, 1), candidates.len);
+    try std.testing.expectEqualStrings("shared", candidates[0].key);
     try std.testing.expect(@abs(candidates[0].vector_score.? - 0.85) < 0.001);
 }
 

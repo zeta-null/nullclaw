@@ -498,12 +498,13 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2]);
     } else if (std.mem.eql(u8, subcmd, "add-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--to <id>]\n", .{});
+            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
             std.process.exit(1);
         }
         var model: ?[]const u8 = null;
         var delivery_mode: yc.cron.DeliveryMode = .none;
         var channel: ?[]const u8 = null;
+        var account_id: ?[]const u8 = null;
         var to: ?[]const u8 = null;
 
         var i: usize = 3;
@@ -516,6 +517,9 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--channel")) {
                 channel = sub_args[i + 1];
                 i += 1;
+            } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--account")) {
+                account_id = sub_args[i + 1];
+                i += 1;
             } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--to")) {
                 to = sub_args[i + 1];
                 i += 1;
@@ -524,8 +528,10 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         const delivery = yc.cron.DeliveryConfig{
             .mode = delivery_mode,
             .channel = channel,
+            .account_id = account_id,
             .to = to,
             .channel_owned = false,
+            .account_id_owned = false,
             .to_owned = false,
         };
         try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], model, delivery);

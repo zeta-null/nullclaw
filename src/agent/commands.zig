@@ -3181,7 +3181,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (std.mem.eql(u8, sub, "get")) {
         const key = std.mem.trim(u8, rest, " \t");
         if (key.len == 0) return try self.allocator.dupe(u8, "Usage: /memory get <key>");
-        const entry = mem_rt.memory.get(self.allocator, key) catch |err| {
+        const entry = mem_rt.memory.getScoped(self.allocator, key, self.memory_session_id) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory get failed: {s}", .{@errorName(err)});
         };
         if (entry) |e| {
@@ -3214,7 +3214,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const query = std.mem.trim(u8, query_buf.items, " \t");
         if (query.len == 0) return try self.allocator.dupe(u8, "Usage: /memory search <query> [--limit N]");
 
-        const results = mem_rt.search(self.allocator, query, limit, null) catch |err| {
+        const results = mem_rt.search(self.allocator, query, limit, self.memory_session_id) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory search failed: {s}", .{@errorName(err)});
         };
         defer memory_mod.retrieval.freeCandidates(self.allocator, results);
@@ -3261,7 +3261,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
             return try std.fmt.allocPrint(self.allocator, "Unknown option for /memory list: {s}", .{tok});
         }
 
-        const entries = mem_rt.memory.list(self.allocator, category_opt, null) catch |err| {
+        const entries = mem_rt.memory.list(self.allocator, category_opt, self.memory_session_id) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
         };
         defer memory_mod.freeEntries(self.allocator, entries);

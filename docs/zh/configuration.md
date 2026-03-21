@@ -5,7 +5,7 @@ NullClaw 与 OpenClaw 配置结构兼容，使用 `snake_case` 字段风格。
 ## 页面导航
 
 - 这页适合谁：已经装好 NullClaw，准备生成、修改或审查 `config.json` 的使用者与运维者。
-- 看完去哪里：要把配置真正跑起来看 [使用与运维](./usage.md)；要理解安全边界看 [安全机制](./security.md)；要查看命令入口与覆盖参数看 [命令参考](./commands.md)。
+- 看完去哪里：要把配置真正跑起来看 [使用与运维](./usage.md)；要理解安全边界看 [安全机制](./security.md)；要查看命令入口与覆盖参数看 [命令参考](./commands.md)；要接非 core 渠道看 [外部渠道插件](./external-channels.md)。
 - 如果你是从某页来的：从 [安装指南](./installation.md) 来，下一步通常就是生成初始配置；从 [Gateway API](./gateway-api.md) 来，这页可回查 `gateway` 与 channel 相关字段；从 [安全机制](./security.md) 来，这页提供具体配置落点与示例。
 
 ## 配置文件位置
@@ -145,10 +145,165 @@ nullclaw onboard --interactive
   }
 }
 ```
+
+#### `agents.list[].workspace_path`
+
+当某个命名 agent 需要使用独立工作区而不是全局工作区时，使用 `workspace_path`。
+
+示例：
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "coder",
+        "model": { "primary": "ollama/qwen2.5-coder:14b" },
+        "system_prompt": "Focus on implementation and tests.",
+        "workspace_path": "agents/coder"
+      }
+    ]
+  }
+}
+```
+
+行为说明：
+
+- 相对路径会相对于 `config.json` 所在目录解析。
+- 绝对路径会原样使用。
+- 配置中可以写 `/` 或 `\`，运行时会按当前操作系统规范化路径分隔符。
+- 首次使用时，如果工作区不存在，nullclaw 会自动创建并初始化：
+  - `AGENTS.md`
+  - `SOUL.md`
+  - `IDENTITY.md`
+  - `MEMORY.md`
+
+隔离模型：
+
+- 该 agent 的文件操作、markdown memory 文件以及 workspace 相关上下文都会使用这个工作区。
+- 设置 `workspace_path` 后，该 agent 还会获得一个持久 memory namespace，格式为 `agent:<agent-id>`。
+- 这个 namespace 会用于：
+  - `nullclaw agent --agent <id>`
+  - `/subagents spawn --agent <id> ...`
+  - 通过 `bindings` 路由到该命名 agent 的会话
+
+实际效果：
+
+- 两个命名 agent 即使使用相同的 provider/model，也可以保持各自独立的持久笔记和工作区。
+- `workspace_path` 本身不会决定聊天路由；路由仍然由 `bindings`、`/bind` 或显式 `--agent` / `/subagents spawn --agent` 决定。
+
+### `identity`（AIEOS v1.1）
+
+如果你希望运行时身份来自 AIEOS 文档，可以使用这一节。配置后，nullclaw 会把解析后的 AIEOS 内容连同 `AGENTS.md`、`IDENTITY.md` 等工作区身份文件一起注入 system prompt：
+
+```json
+{
+  "identity": {
+    "format": "aieos",
+    "aieos_path": "./identity/aieos.identity.json"
+  }
+}
+```
+
+也可以直接把同样的文档内联到配置里：
+
+```json
+{
+  "identity": {
+    "format": "aieos",
+    "aieos_inline": "{\"identity\":{\"names\":{\"first\":\"nullclaw-assistant\"},\"bio\":\"通用自主助手\"},\"linguistics\":{\"style\":\"concise\"},\"motivations\":{\"core_drive\":\"安全地帮助操作者完成任务\"}}"
+  }
+}
+```
+
+最小 AIEOS v1.1 示例文件（`identity/aieos.identity.json`）：
+
+```json
+{
+  "identity": {
+    "names": {
+      "first": "nullclaw-assistant"
+    },
+    "bio": "通用自主助手"
+  },
+  "linguistics": {
+    "style": "concise"
+  },
+  "motivations": {
+    "core_drive": "安全地帮助操作者完成任务"
+  }
+}
+```
+
+说明：
+
+- AIEOS payload 采用 `identity`、`psychology`、`linguistics`、`motivations`、`capabilities` 等顶层 section。
+- 为了可维护性和版本控制可读性，优先使用 `aieos_path`。
+- 只有在你确实需要单文件自包含配置时，再使用 `aieos_inline`。
+- `identity.format` 应与 payload 来源保持一致，也就是 `aieos`。
+- 相对路径的 `aieos_path` 会优先按当前 workspace 解析，找不到时再按当前工作目录解析。
+
 ### `channels`
 
 - 渠道配置统一在 `channels.<name>` 下。
 - 多账号渠道通常用 `accounts` 包裹。
+
+外部渠道插件示例：
+
+```json
+{
+  "channels": {
+    "external": {
+      "accounts": {
+        "wa-web": {
+          "runtime_name": "whatsapp_web",
+          "transport": {
+            "command": "nullclaw-plugin-whatsapp-web",
+            "args": ["--stdio"],
+            "timeout_ms": 10000,
+            "env": {
+              "PLUGIN_TOKEN": "secret"
+            }
+          },
+          "config": {
+            "bridge_url": "http://127.0.0.1:3301",
+            "allow_from": ["*"]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+外部渠道说明：
+
+完整的协议、生命周期、metadata 约定和插件作者契约，请继续看
+[外部渠道插件](./external-channels.md)。
+
+- `runtime_name` 是 nullclaw 内部使用的运行时渠道 id，routing、bindings、session key 和出站分发都会使用它。它不能复用内建 channel 名称，也不能和任何其他已配置 channel 已占用的运行时名字冲突。
+- `transport.command` 和可选的 `transport.args` 会把插件作为子进程启动，并通过 stdio 上的逐行 JSON-RPC 通信。
+- `transport.timeout_ms` 会限制 host 到插件的 RPC 等待时间；同时 nullclaw 还会在内部对 control-plane 请求做上限裁剪，避免一个坏插件把 supervision 卡住几分钟。
+- `transport.env` 只会传给插件进程本身。
+- `config` 必须是 JSON object；它会原样透传给插件 `start` 请求里的 `params.config`。
+- 插件必须响应 `get_manifest`，处理 `start`、`send`、`stop`；建议实现 `health`，这样 supervision 才能识别“进程活着但 sidecar 已断开”的状态。
+- `get_manifest.result` 现在必须显式声明 `protocol_version: 2`；`capabilities.health`、`capabilities.streaming`、`capabilities.send_rich`、`capabilities.typing`、`capabilities.edit`、`capabilities.delete`、`capabilities.reactions`、`capabilities.read_receipts` 都是可选能力标记。
+- `health.result` 必须返回显式布尔值（`healthy`）或显式健康信号（`ok`、`connected`、`logged_in`）；空对象会被视为无效响应。
+- `start.params` 现在包含嵌套的 `runtime` 对象，里面有 `name`、`account_id` 和 host 提供的 `state_dir`。
+- `start.result` 必须返回 `started: true`；`send`、`send_rich`、`edit_message`、`delete_message` 以及其他 typing/message-action RPC 在真正接受动作时都必须返回 `result.accepted: true`。仅仅没有 JSON-RPC `error` 已经不够了。
+- `send.params` 现在也拆成嵌套的 `runtime` 和 `message` 对象；文本字段统一使用 `message.text`。
+- 如果插件同时声明了 `capabilities.edit=true` 和 `capabilities.delete=true`，那么 `send.result` 还可以返回 `message_id`，或者返回 `message { target?, message_id }`；这样 nullclaw 就能在不支持原生 `.chunk` 流式发送的渠道上维护一条可编辑的草稿消息。
+- 如果 `capabilities.streaming=true`，nullclaw 可能在模型流式输出时发送 `.chunk` 阶段的 `send` 事件；如果缺省或为 `false`，只会发送最终结果。
+- 如果 `capabilities.send_rich=true`，host 还可能调用 `send_rich`，其参数同样包含嵌套的 `runtime` 和 `message { target, text, attachments, choices }`。
+- 如果 `capabilities.typing=true`，host 还可能调用 `start_typing` / `stop_typing`，参数包含嵌套的 `runtime` 和 `recipient`。
+- 如果声明了 `capabilities.edit=true` / `capabilities.delete=true`，host 还可能调用 `edit_message` / `delete_message`。
+- 如果声明了 `capabilities.reactions=true` 或 `capabilities.read_receipts=true`，host 还可能调用 `set_reaction` 和 `mark_read`。
+- `inbound_message.params.message` 必须包含 `sender_id`、`chat_id`、`text`；如果带了 `metadata`，它必须是 JSON object；如果带了 `media`，它必须是由非空字符串组成的数组。
+- 如果希望 unknown channel 也能正确做 routing/bindings，建议在 `metadata` 里带上 `peer_kind` 和 `peer_id`。
+- unknown/external channel 也可以提供 `metadata.is_group`、`metadata.is_dm` 或 `metadata.typing_recipient`，nullclaw 会把这些信息提升到 prompt 的 conversation context 和处理状态路由里。
+- PR #265 的 WhatsApp Web bridge 兼容适配器示例放在 `examples/whatsapp-web/nullclaw-plugin-whatsapp-web`。
+- 生产级的配套仓库已经移到仓库外：[nullclaw/nullclaw-channel-baileys](https://github.com/nullclaw/nullclaw-channel-baileys) 和 [nullclaw/nullclaw-channel-whatsmeow-bridge](https://github.com/nullclaw/nullclaw-channel-whatsmeow-bridge)。
+- `nullclaw channel start external` 会启动第一个已配置的外部账号；`nullclaw channel start <runtime_name>` 可以直接启动某个具体运行时名字，比如 `whatsapp_web`。
 
 Telegram 示例：
 

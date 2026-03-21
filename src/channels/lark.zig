@@ -146,7 +146,7 @@ pub const LarkChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const LarkChannel, open_id: []const u8) bool {
-        return root.isAllowedExact(self.allow_from, open_id);
+        return root.isAllowedExactScoped("lark channel", self.allow_from, open_id);
     }
 
     pub fn setBus(self: *LarkChannel, b: *bus.Bus) void {
@@ -304,6 +304,48 @@ pub const LarkChannel = struct {
 
     fn statusCodeIsSuccess(code: u16) bool {
         return code >= 200 and code < 300;
+    }
+
+    fn messageSuggestsPermissionIssue(msg: []const u8) bool {
+        if (msg.len == 0) return false;
+        if (std.mem.indexOf(u8, msg, "权限") != null) return true;
+
+        var lower_buf: [512]u8 = undefined;
+        const n = @min(msg.len, lower_buf.len);
+        for (msg[0..n], 0..) |c, i| {
+            lower_buf[i] = std.ascii.toLower(c);
+        }
+        const lower = lower_buf[0..n];
+        return std.mem.indexOf(u8, lower, "permission") != null or
+            std.mem.indexOf(u8, lower, "scope") != null or
+            std.mem.indexOf(u8, lower, "forbidden") != null or
+            std.mem.indexOf(u8, lower, "unauthorized") != null;
+    }
+
+    fn validateBusinessResponse(allocator: std.mem.Allocator, op: []const u8, body: []const u8) !void {
+        if (body.len == 0) return;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+
+        const code_val = parsed.value.object.get("code") orelse return;
+        const code = switch (code_val) {
+            .integer => |v| v,
+            .float => |v| @as(i64, @intFromFloat(v)),
+            else => return,
+        };
+        if (code == 0) return;
+
+        const msg = if (parsed.value.object.get("msg")) |msg_val|
+            (if (msg_val == .string) msg_val.string else "")
+        else
+            "";
+
+        log.warn("lark {s} failed with API code {d}: {s}", .{ op, code, msg });
+        if (messageSuggestsPermissionIssue(msg)) {
+            log.warn("lark {s} likely requires additional app permissions/scopes in Feishu/Lark console", .{op});
+        }
+        return error.LarkApiError;
     }
 
     fn extractCardActionOpenId(event: std.json.Value) ?[]const u8 {
@@ -603,6 +645,7 @@ pub const LarkChannel = struct {
         defer self.allocator.free(resp.body);
 
         if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
+        try validateBusinessResponse(self.allocator, "tenant_access_token", resp.body);
 
         const resp_body = resp.body;
         if (resp_body.len == 0) return error.LarkApiError;
@@ -692,12 +735,14 @@ pub const LarkChannel = struct {
             if (!statusCodeIsSuccess(retry_resp.status_code)) {
                 return error.LarkApiError;
             }
+            try validateBusinessResponse(self.allocator, "send_message", retry_resp.body);
             return;
         }
 
         if (!statusCodeIsSuccess(send_resp.status_code)) {
             return error.LarkApiError;
         }
+        try validateBusinessResponse(self.allocator, "send_message", send_resp.body);
     }
 
     fn buildWebsocketConfigUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
@@ -1018,7 +1063,12 @@ pub const LarkChannel = struct {
 
         while (self.running.load(.acquire)) {
             const maybe_message = ws.readMessage() catch |err| {
-                log.warn("lark websocket read failed: {}", .{err});
+                const err_name = @errorName(err);
+                if (std.mem.eql(u8, err_name, "ConnectionClosed") or std.mem.eql(u8, err_name, "EndOfStream")) {
+                    log.info("lark websocket closed by remote, reconnecting", .{});
+                } else {
+                    log.warn("lark websocket read failed: {}", .{err});
+                }
                 break;
             };
             if (maybe_message == null) break;
@@ -2181,6 +2231,27 @@ test "lark stripAtPlaceholders preserves normal @ mentions" {
     const result = try stripAtPlaceholders(allocator, "Hello @john how are you?");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Hello @john how are you?", result);
+}
+
+test "lark messageSuggestsPermissionIssue matches english keywords" {
+    try std.testing.expect(LarkChannel.messageSuggestsPermissionIssue("forbidden: missing permission scope"));
+    try std.testing.expect(LarkChannel.messageSuggestsPermissionIssue("Unauthorized app scope"));
+    try std.testing.expect(!LarkChannel.messageSuggestsPermissionIssue("request timeout"));
+}
+
+test "lark messageSuggestsPermissionIssue matches chinese keyword" {
+    try std.testing.expect(LarkChannel.messageSuggestsPermissionIssue("需要开放权限"));
+}
+
+test "lark validateBusinessResponse accepts success code" {
+    try LarkChannel.validateBusinessResponse(std.testing.allocator, "send_message", "{\"code\":0,\"msg\":\"ok\"}");
+}
+
+test "lark validateBusinessResponse rejects nonzero code" {
+    try std.testing.expectError(
+        error.LarkApiError,
+        LarkChannel.validateBusinessResponse(std.testing.allocator, "send_message", "{\"code\":999,\"msg\":\"forbidden\"}"),
+    );
 }
 // ════════════════════════════════════════════════════════════════════════════
 // WebSocket Tests

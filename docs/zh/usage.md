@@ -56,6 +56,8 @@ nullclaw gateway
 
 建议在长期运行场景使用 service 子命令：
 
+- Linux 环境会优先使用 `systemd --user`，在 Alpine / OpenRC 系统上会自动切换为 OpenRC。
+
 ```bash
 nullclaw service install
 nullclaw service start
@@ -118,6 +120,8 @@ nullclaw onboard --interactive
 - `channels.<name>.accounts.*` 的 token / webhook / account 字段是否正确。
 - `allow_from` 是否误设为空数组。
 - `nullclaw channel status` 是否有 unhealthy 标记。
+- 如果是 DingTalk，进一步看
+  [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)。
 
 ### 4) 网关启动但外部不可访问
 

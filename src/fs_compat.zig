@@ -87,6 +87,8 @@ test "stat returns file size" {
 }
 
 test "makePath creates single directory" {
+    if (builtin.os.tag == .wasi) return;
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
@@ -104,6 +106,8 @@ test "makePath creates single directory" {
 }
 
 test "makePath creates nested directories" {
+    if (builtin.os.tag == .wasi) return;
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
@@ -120,6 +124,8 @@ test "makePath creates nested directories" {
 }
 
 test "makePath succeeds when directory already exists" {
+    if (builtin.os.tag == .wasi) return;
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
@@ -143,6 +149,8 @@ test "makePath is a no-op for empty string" {
 }
 
 test "makePath fails when a path component is a file" {
+    if (builtin.os.tag == .wasi) return;
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
@@ -160,6 +168,8 @@ test "makePath fails when a path component is a file" {
 }
 
 test "makePath supports relative paths" {
+    if (builtin.os.tag == .wasi) return;
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 

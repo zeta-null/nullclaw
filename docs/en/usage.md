@@ -70,6 +70,8 @@ nullclaw gateway
 
 For long-running deployments:
 
+- Linux uses `systemd --user` when available and falls back to OpenRC on Alpine/OpenRC systems.
+
 ```bash
 nullclaw service install
 nullclaw service start
@@ -132,6 +134,8 @@ Check:
 - `channels.<name>.accounts.*` token/webhook/account settings.
 - `allow_from` accidentally set to empty array.
 - `nullclaw channel status` health output.
+- For DingTalk-specific stream and reply-target checks, open
+  [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md).
 
 ### 4) Gateway starts but is unreachable externally
 

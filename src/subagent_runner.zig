@@ -21,6 +21,33 @@ fn findProviderEntry(
     return null;
 }
 
+fn buildSubagentSystemPrompt(
+    allocator: std.mem.Allocator,
+    system_prompt: []const u8,
+    workspace_dir: []const u8,
+    tools: []const tools_mod.Tool,
+) ![]const u8 {
+    const tool_instructions = try agent_mod.prompt.buildToolInstructions(allocator, tools);
+    defer allocator.free(tool_instructions);
+
+    const skills_section = try agent_mod.prompt.buildSkillsSection(allocator, workspace_dir);
+    defer allocator.free(skills_section);
+
+    if (skills_section.len > 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n{s}{s}",
+            .{ system_prompt, skills_section, tool_instructions },
+        );
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\n\n{s}",
+        .{ system_prompt, tool_instructions },
+    );
+}
+
 /// Execute a spawned subagent task with the full agent tool loop, constrained
 /// to the restricted `subagentTools` tool set.
 pub fn runTaskWithTools(
@@ -72,6 +99,7 @@ pub fn runTaskWithTools(
         .http_enabled = request.http_enabled,
         .http_allowed_domains = request.http_allowed_domains,
         .http_max_response_size = request.http_max_response_size,
+        .http_timeout_secs = request.http_timeout_secs,
         .allowed_paths = request.allowed_paths,
         .policy = &policy,
         .tools_config = request.tools_config,
@@ -108,29 +136,29 @@ pub fn runTaskWithTools(
             .enabled = request.http_enabled,
             .allowed_domains = request.http_allowed_domains,
             .max_response_size = request.http_max_response_size,
+            .timeout_secs = request.http_timeout_secs,
         },
         .tools = request.tools_config,
     };
 
     var noop_obs = observability.NoopObserver{};
+    const obs = request.observer orelse noop_obs.observer();
     var agent = try agent_mod.Agent.fromConfig(
         allocator,
         &cfg,
         provider_holder.provider(),
         tools,
         mem_opt,
-        noop_obs.observer(),
+        obs,
     );
     defer agent.deinit();
     agent.policy = &policy;
 
-    const tool_instructions = try agent_mod.prompt.buildToolInstructions(allocator, tools);
-    defer allocator.free(tool_instructions);
-
-    const full_system = try std.fmt.allocPrint(
+    const full_system = try buildSubagentSystemPrompt(
         allocator,
-        "{s}\n\n{s}",
-        .{ request.system_prompt, tool_instructions },
+        request.system_prompt,
+        request.workspace_dir,
+        tools,
     );
     // After append, ownership transfers to agent.history; agent.deinit() frees it.
     // Use catch to free only if append itself fails (avoids double-free with deinit).
@@ -144,7 +172,7 @@ pub fn runTaskWithTools(
     agent.has_system_prompt = true;
     agent.system_prompt_has_conversation_context = false;
     agent.system_prompt_conversation_context_fingerprint = null;
-    agent.workspace_prompt_fingerprint = agent_mod.prompt.workspacePromptFingerprint(allocator, request.workspace_dir, agent.bootstrap) catch null;
+    agent.workspace_prompt_fingerprint = agent_mod.prompt.workspacePromptFingerprint(allocator, request.workspace_dir, agent.bootstrap, null) catch null;
 
     return agent.turn(request.task);
 }
@@ -163,4 +191,41 @@ test "findProviderEntry matches provider aliases" {
     };
     const found = findProviderEntry("AZURE-OPENAI", &entries) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://resource.openai.azure.com/openai/v1", found.base_url.?);
+}
+
+test "buildSubagentSystemPrompt includes installed skills before tool instructions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/commit");
+
+    {
+        const f = try tmp.dir.createFile("skills/commit/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"commit\", \"description\": \"Git commit helper\", \"always\": true}");
+    }
+    {
+        const f = try tmp.dir.createFile("skills/commit/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Always stage before committing.");
+    }
+
+    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_dir);
+
+    const no_tools = [_]tools_mod.Tool{};
+    const prompt = try buildSubagentSystemPrompt(
+        allocator,
+        "You are a background subagent.",
+        workspace_dir,
+        no_tools[0..],
+    );
+    defer allocator.free(prompt);
+
+    const skills_idx = std.mem.indexOf(u8, prompt, "## Skills") orelse return error.TestUnexpectedResult;
+    const tools_idx = std.mem.indexOf(u8, prompt, "## Tool Use Protocol") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Always stage before committing.") != null);
+    try std.testing.expect(skills_idx < tools_idx);
 }

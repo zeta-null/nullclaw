@@ -15,6 +15,7 @@ NullClaw is compatible with OpenClaw config structure and uses `snake_case` keys
 - Open [Usage and Operations](./usage.md) after config edits to validate runtime behavior
 - Open [Security](./security.md) before widening permissions, public exposure, or tool scope
 - Open [Gateway API](./gateway-api.md) if your config changes affect pairing, webhooks, or external integrations
+- Open [External Channel Plugins](./external-channels.md) if you are wiring a non-core channel
 
 **If you came from ...**
 
@@ -204,9 +205,56 @@ Notes:
 - Prefer short stable ids (`coder`, `researcher`) so chat commands stay simple.
 - Keep specialist prompts narrow; broad prompts overlap and reduce routing clarity.
 
+#### `agents.list[].workspace_path`
+
+Use `workspace_path` when a named agent should run from its own workspace instead of the global one.
+
+Example:
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "coder",
+        "model": { "primary": "ollama/qwen2.5-coder:14b" },
+        "system_prompt": "Focus on implementation and tests.",
+        "workspace_path": "agents/coder"
+      }
+    ]
+  }
+}
+```
+
+Behavior:
+
+- Relative paths are resolved relative to the directory that contains `config.json`.
+- Absolute paths are used as-is.
+- Both `/` and `\` are accepted in config; the runtime normalizes separators for the current OS.
+- On first use, nullclaw scaffolds the workspace if missing and creates:
+  - `AGENTS.md`
+  - `SOUL.md`
+  - `IDENTITY.md`
+  - `MEMORY.md`
+
+Isolation model:
+
+- The agent's file operations, markdown memory files, and workspace-scoped context use that workspace.
+- When `workspace_path` is set, the agent also gets a durable memory namespace of the form `agent:<agent-id>`.
+- That namespace is used by:
+  - `nullclaw agent --agent <id>`
+  - `/subagents spawn --agent <id> ...`
+  - routed sessions that resolve to that named agent through `bindings`
+
+Practical effect:
+
+- Two named agents can share the same provider/model family but keep separate durable notes and separate workspaces.
+- `workspace_path` does not route chats by itself. Routing still comes from `bindings`, `/bind`, or explicit `--agent` / `/subagents spawn --agent`.
+
 ### `identity` (AIEOS v1.1)
 
-Use this section when you want the runtime identity to come from an AIEOS document:
+Use this section when you want the runtime identity to come from an AIEOS document.
+When configured, nullclaw injects the parsed AIEOS content into the system prompt alongside workspace identity files such as `AGENTS.md` and `IDENTITY.md`:
 
 ```json
 {
@@ -253,11 +301,69 @@ Notes:
 - Prefer `aieos_path` for maintainability and version control readability.
 - Use `aieos_inline` only when you need a fully self-contained single config file.
 - Keep `identity.format` aligned with the payload source (`aieos`).
+- Relative `aieos_path` values are resolved against the active workspace first, then against the current working directory.
 
 ### `channels`
 
 - Channel config lives under `channels.<name>`.
 - Multi-account channels typically use an `accounts` wrapper.
+
+External channel plugin example:
+
+```json
+{
+  "channels": {
+    "external": {
+      "accounts": {
+        "wa-web": {
+          "runtime_name": "whatsapp_web",
+          "transport": {
+            "command": "nullclaw-plugin-whatsapp-web",
+            "args": ["--stdio"],
+            "timeout_ms": 10000,
+            "env": {
+              "PLUGIN_TOKEN": "secret"
+            }
+          },
+          "config": {
+            "bridge_url": "http://127.0.0.1:3301",
+            "allow_from": ["*"]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+External channel notes:
+
+For the full protocol, lifecycle, metadata conventions, and plugin author
+contract, see [External Channel Plugins](./external-channels.md).
+
+- `runtime_name` is the nullclaw runtime channel id used by routing, bindings, session keys, and outbound dispatch. It must not reuse a built-in channel name or any runtime name already claimed by another configured channel.
+- `transport.command` plus optional `transport.args` starts the plugin as a child process over line-delimited JSON-RPC on stdio.
+- `transport.timeout_ms` bounds host->plugin RPC waits; nullclaw still caps control-plane waits internally so one broken plugin cannot stall supervision for minutes.
+- `transport.env` is forwarded only to the plugin process.
+- `config` must be a JSON object; it is forwarded to the plugin `start` request as `params.config`.
+- Plugins must answer `get_manifest`, handle `start`/`send`/`stop`; `health` is recommended so supervision can detect disconnected sidecars instead of only live processes.
+- `get_manifest.result` must contain `protocol_version: 2`; `capabilities.health`, `capabilities.streaming`, `capabilities.send_rich`, `capabilities.typing`, `capabilities.edit`, `capabilities.delete`, `capabilities.reactions`, and `capabilities.read_receipts` are optional capability bits.
+- `health.result` must report an explicit boolean (`healthy`) or explicit health signals (`ok`, `connected`, `logged_in`); an empty object is treated as invalid.
+- `start.params` now has a nested `runtime` object with `name`, `account_id`, and host-owned `state_dir`.
+- `start.result` must contain `started: true`; `send`, `send_rich`, `edit_message`, `delete_message`, and typing/message-action RPCs must return `result.accepted: true` when the plugin actually accepts the action. A JSON-RPC success envelope by itself is not enough.
+- `send.params` now has nested `runtime` and `message` objects; text payloads use `message.text`.
+- If a plugin declares both `capabilities.edit=true` and `capabilities.delete=true`, `send.result` may also include `message_id` or `message { target?, message_id }`; that lets nullclaw keep a tracked draft updated on channels that do not support native `.chunk` streaming.
+- If `capabilities.streaming=true`, nullclaw may emit `.chunk` staged `send` events during model streaming. If it is absent or `false`, nullclaw will only emit final responses.
+- If `capabilities.send_rich=true`, the host may call `send_rich` with nested `runtime` and `message { target, text, attachments, choices }`.
+- If `capabilities.typing=true`, the host may call `start_typing` / `stop_typing` with nested `runtime` plus `recipient`.
+- If `capabilities.edit=true` / `capabilities.delete=true`, the host may call `edit_message` / `delete_message`.
+- If `capabilities.reactions=true` or `capabilities.read_receipts=true`, the host may call `set_reaction` and `mark_read`.
+- `inbound_message.params.message` must include `sender_id`, `chat_id`, and `text`; if `metadata` is present it must be a JSON object, and if `media` is present it must be an array of non-empty strings.
+- Include `metadata.peer_kind` plus `metadata.peer_id` when you want routing/bindings to distinguish direct vs group peers for unknown channels.
+- Unknown/external channels can also set `metadata.is_group`, `metadata.is_dm`, or `metadata.typing_recipient`; nullclaw promotes that metadata into prompt conversation context and processing-indicator routing.
+- A reference bridge adapter for the PR #265 WhatsApp Web sidecar lives in `examples/whatsapp-web/nullclaw-plugin-whatsapp-web`.
+- Production companion repositories now live out of tree: [nullclaw/nullclaw-channel-baileys](https://github.com/nullclaw/nullclaw-channel-baileys) and [nullclaw/nullclaw-channel-whatsmeow-bridge](https://github.com/nullclaw/nullclaw-channel-whatsmeow-bridge).
+- `nullclaw channel start external` starts the first configured external account; `nullclaw channel start <runtime_name>` targets a specific configured runtime name such as `whatsapp_web`.
 
 Telegram example:
 
